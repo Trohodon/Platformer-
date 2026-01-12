@@ -26,10 +26,6 @@ def _rng_seed(seed):
     return seed if seed is not None else random.randrange(1, 2_000_000_000)
 
 
-def _in_bounds(x, y, cols, rows):
-    return 0 <= x < cols and 0 <= y < rows
-
-
 def _is_solid(ch: str) -> bool:
     return ch in ("#", "C", "M")
 
@@ -70,39 +66,29 @@ def _place_platform(grid, x0, y, length, ch="#"):
 
 
 def _top_surface_cells(grid):
-    """Cells (x,y) where player can stand: solid at (x,y) and empty above at (x,y-1)."""
     rows = len(grid)
     cols = len(grid[0])
     tops = []
     for y in range(1, rows):
         for x in range(cols):
             if _is_solid(grid[y][x]) and _is_empty(grid[y - 1][x]):
-                tops.append((x, y - 1))  # standing position is the empty cell above solid
+                tops.append((x, y - 1))
     return tops
 
 
 def _reachable_validator(grid, spawn_xy, goal_y_max, min_gap_tiles, max_gap_tiles,
                          max_dx_single, max_dx_double, approx_single_h_tiles):
-    """
-    Graph node = standable cell above a solid.
-    Edge from A->B if B is within (dx, dy) jump envelope.
-    We require a path from spawn to any node with y <= goal_y_max.
-    """
     rows = len(grid)
-    cols = len(grid[0])
-
     tops = _top_surface_cells(grid)
     if not tops:
         return False
 
-    # index tops by y for faster lookup
     tops_by_y = {}
     for x, y in tops:
         tops_by_y.setdefault(y, []).append(x)
 
     sx, sy = spawn_xy
 
-    # Find nearest standable node to spawn (within a small radius)
     start = None
     best_d = 10**9
     for x, y in tops:
@@ -117,20 +103,15 @@ def _reachable_validator(grid, spawn_xy, goal_y_max, min_gap_tiles, max_gap_tile
     q = deque([start])
     visited = set([start])
 
-    # Helper: test candidates from a node
     def neighbors(ax, ay):
-        # Only consider landing higher than current (smaller y), and also small drops
-        # We'll allow mild drops too to avoid “dead ends”.
         for by in range(max(1, ay - (max_gap_tiles + 2)), min(rows - 1, ay + 6)):
             if by not in tops_by_y:
                 continue
-            dy = ay - by  # positive means target is higher
-            # Determine if this requires double jump
+
+            dy = ay - by  # + means target higher
             needs_double = dy > approx_single_h_tiles
             max_dx = max_dx_double if needs_double else max_dx_single
 
-            # Only allow upward within our designed gap band (with a little tolerance),
-            # and downward not too far (drops are okay but limited).
             if dy > 0:
                 if dy < int(0.70 * min_gap_tiles) or dy > int(1.20 * max_gap_tiles):
                     continue
@@ -155,15 +136,6 @@ def _reachable_validator(grid, spawn_xy, goal_y_max, min_gap_tiles, max_gap_tile
 
 
 def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
-    """
-    All-in-one generator:
-    1) Rooms + doors
-    2) Biome themes
-    3) Hazards (^), plus crumble (C) and moving (M) placeholders
-    4) Validator to avoid dead ends (regenerates until valid)
-    """
-
-    # ---- Jump / reach numbers ----
     h1 = _single_jump_height_px()
     min_gap_tiles = max(1, int(round((0.75 * h1) / TILE_SIZE)))
     max_gap_tiles = max(min_gap_tiles, int(round((1.50 * h1) / TILE_SIZE)))
@@ -171,13 +143,11 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
 
     t_apex = _time_to_apex()
     single_air = 2.0 * t_apex
-    double_air = 4.0 * t_apex  # rough
+    double_air = 4.0 * t_apex
     max_dx_single = max(3, int((MOVE_SPEED * single_air) / TILE_SIZE))
     max_dx_double = max(max_dx_single + 2, int((MOVE_SPEED * double_air) / TILE_SIZE))
 
-    # ---- Biomes (tunes generation) ----
     biomes = [
-        # name, room_count, extra_plats, spike_density, wall_density, intensity
         ("ruins",   (4, 6),  (25, 40), 0.06, 0.55, 1.0),
         ("cavern",  (3, 5),  (35, 55), 0.08, 0.35, 1.2),
         ("tower",   (5, 8),  (20, 35), 0.05, 0.75, 0.9),
@@ -186,27 +156,21 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
 
     base_seed = _rng_seed(seed)
 
-    # ---- Regenerate until valid (no dead ends) ----
     for attempt in range(60):
         rng = random.Random(base_seed + attempt * 99991)
+        _, room_range, extra_range, spike_density, wall_density, intensity = rng.choice(biomes)
 
-        biome = rng.choice(biomes)
-        _, room_range, extra_range, spike_density, wall_density, intensity = biome
-
-        # Grid init
         grid = [["." for _ in range(cols)] for _ in range(rows)]
 
-        # Border walls
         for y in range(rows):
             grid[y][0] = "#"
             grid[y][cols - 1] = "#"
 
-        # Ground (2 thick)
         for y in range(rows - 2, rows):
             for x in range(cols):
                 grid[y][x] = "#"
 
-        # -------- Rooms (solid shells + carved interior) --------
+        # -------- Rooms --------
         room_count = rng.randint(*room_range)
         rooms = []
         for _ in range(room_count):
@@ -215,39 +179,41 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
             x0 = rng.randint(2, cols - w - 2)
             y0 = rng.randint(2, rows - h - 4)
 
-            # outer shell
             _place_rect_solid(grid, x0, y0, w, h, "#")
-            # carve interior
             _carve_rect_empty(grid, x0 + 1, y0 + 1, w - 2, h - 2)
-
             rooms.append((x0, y0, w, h))
 
-            # add a “floor” inside room (platform)
             floor_y = y0 + h - 2
             plat_len = rng.randint(max(6, w - 10), w - 2)
             plat_x = x0 + rng.randint(1, max(1, (w - plat_len - 1)))
             _place_platform(grid, plat_x, floor_y, plat_len, "#")
 
-        # -------- Doors between rooms (gaps in walls) --------
-        # connect successive rooms with a “door” carved in a wall
+        # -------- Doors between rooms (FIXED) --------
         for i in range(len(rooms) - 1):
             x0, y0, w0, h0 = rooms[i]
             x1, y1, w1, h1r = rooms[i + 1]
 
-            # Choose a vertical band where both rooms overlap-ish
-            door_y = rng.randint(max(y0 + 2, y1 + 2), min(y0 + h0 - 3, y1 + h1r - 3))
-            # carve a short horizontal corridor between them
+            lo = max(y0 + 2, y1 + 2)
+            hi = min(y0 + h0 - 3, y1 + h1r - 3)
+
+            # If there is no valid overlap band, skip making a door between these rooms.
+            if lo > hi:
+                continue
+
+            door_y = rng.randint(lo, hi)
+
             ax = x0 + w0 - 1
             bx = x1
             if ax > bx:
                 ax, bx = bx, ax
+
             for x in range(ax, bx + 1):
                 if 1 <= x <= cols - 2 and 1 <= door_y <= rows - 3:
                     grid[door_y][x] = "."
                     grid[door_y - 1][x] = "."
-                    grid[door_y + 1][x] = "."  # makes corridor feel less tight
+                    grid[door_y + 1][x] = "."
 
-        # -------- Main intense platform path (guaranteed-ish by validator) --------
+        # -------- Main platform path --------
         platform_min_len = 4
         platform_max_len = int(12 * intensity)
 
@@ -256,7 +222,6 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
         current_x0 = rng.randint(3, cols - (length + 4))
         current_x0, current_x1 = _place_platform(grid, current_x0, current_y, length, "#")
 
-        # Spawn
         spawn_x = min(cols - 3, current_x0 + 2)
         spawn_y = max(1, current_y - 1)
         grid[spawn_y][spawn_x] = "P"
@@ -267,7 +232,6 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
 
         while current_y > 4 and safety < 500:
             safety += 1
-
             gap_tiles = rng.randint(min_gap_tiles, max_gap_tiles)
             next_y = current_y - gap_tiles
             if next_y < 2:
@@ -275,7 +239,6 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
 
             length = rng.randint(platform_min_len, max(6, platform_max_len))
             below_center = (current_x0 + current_x1) // 2
-
             needs_double = gap_tiles > approx_single_h_tiles
             max_dx = max_dx_double if needs_double else max_dx_single
 
@@ -287,21 +250,15 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
                 cand_x0 = max(2, min(cols - (length + 3), cand_x0))
                 cand_x1 = cand_x0 + length
 
-                # overlap rule with platform below
-                ov = _overlap_len(cand_x0, cand_x1, current_x0, current_x1)
+                ov = max(0, min(cand_x1, current_x1) - max(cand_x0, current_x0))
                 overlap_ratio = ov / max(1, (current_x1 - current_x0))
                 if overlap_ratio > max_overlap_ratio:
-                    continue
-
-                # avoid stacking directly inside solid room shells (if solid at same y-1 everywhere)
-                if all(_is_solid(grid[next_y][x]) for x in range(cand_x0, cand_x1)):
                     continue
 
                 best = (cand_x0, cand_x1)
                 break
 
             if best is None:
-                # force away placement
                 if below_center < cols // 2:
                     cand_x0 = rng.randint(cols // 2, cols - (length + 3))
                 else:
@@ -315,32 +272,23 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
 
             current_y, current_x0, current_x1 = next_y, placed_x0, placed_x1
 
-        # -------- Extra platforms (more chaos) --------
+        # -------- Extra platforms --------
         extra_count = rng.randint(*extra_range)
         for _ in range(extra_count):
             y = rng.randint(2, rows - 6)
             length = rng.randint(3, int(10 * intensity))
             x0 = rng.randint(2, cols - (length + 3))
-
-            # sometimes crumble or moving
             r = rng.random()
-            if r < 0.10:
-                ch = "C"
-            elif r < 0.16:
-                ch = "M"
-            else:
-                ch = "#"
-
+            ch = "C" if r < 0.10 else "M" if r < 0.16 else "#"
             _place_platform(grid, x0, y, length, ch)
 
-        # -------- Walls / columns / shafts (with gaps) --------
+        # -------- Walls/columns --------
         col_count = rng.randint(int(6 * wall_density), int(14 * wall_density + 2))
         for _ in range(col_count):
             x = rng.randint(4, cols - 5)
             y0 = rng.randint(2, rows // 2)
             y1 = rng.randint(rows // 2, rows - 4)
 
-            # carve a gap near a main path platform so it won't hard-block
             gap_y = None
             if main_path and rng.random() < 0.9:
                 py, _, _ = rng.choice(main_path)
@@ -352,7 +300,6 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
                     continue
                 grid[y][x] = "#"
 
-            # sometimes thicken
             if rng.random() < 0.35:
                 xx = x + rng.choice([-1, 1])
                 if 2 <= xx <= cols - 3:
@@ -361,27 +308,19 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
                             continue
                         grid[y][xx] = "#"
 
-        # -------- Spikes (hazards) --------
-        # place spikes on top of solids (in empty cell above solid),
-        # but avoid the spawn row area for fairness
+        # -------- Spikes --------
+        # Put spikes above solids, avoid spawn neighborhood
         for y in range(2, rows - 3):
             for x in range(2, cols - 2):
                 if (x - spawn_x) ** 2 + (y - spawn_y) ** 2 < 25:
                     continue
                 if _is_solid(grid[y][x]) and _is_empty(grid[y - 1][x]) and rng.random() < spike_density:
-                    # spike lives in the empty cell above the solid
                     grid[y - 1][x] = "^"
-
-        # Ensure 'P' is not treated as solid
-        # (Tilemap will ignore it for solids anyway)
-        # -------- Validate reachability --------
-        # goal: reachable to near top
-        goal_y_max = 4
 
         ok = _reachable_validator(
             grid=grid,
             spawn_xy=(spawn_x, spawn_y),
-            goal_y_max=goal_y_max,
+            goal_y_max=4,
             min_gap_tiles=min_gap_tiles,
             max_gap_tiles=max_gap_tiles,
             max_dx_single=max_dx_single,
@@ -392,7 +331,7 @@ def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
         if ok:
             return ["".join(row) for row in grid]
 
-    # If somehow we failed all attempts, return a simple fallback
+    # fallback
     fallback = [["." for _ in range(cols)] for _ in range(rows)]
     for y in range(rows - 2, rows):
         for x in range(cols):
