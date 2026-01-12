@@ -1,16 +1,17 @@
 # entities/enemy.py
 import pygame
+
 from core.settings import GRAVITY, MAX_FALL_SPEED, TILE_SIZE
 from core.utils import clamp
 
 
 class Enemy:
     """
-    Simple circle enemy that can handle basically any random map:
+    Circle enemy that can handle most random platform layouts:
     - Moves toward player
     - If blocked by wall while grounded -> jumps
     - If player is above and close -> jumps
-    - Uses tile collision like the player
+    - Uses rect-based collision against solid tiles
     """
 
     def __init__(self, x: float, y: float, radius: int = 16):
@@ -20,19 +21,16 @@ class Enemy:
 
         self.max_health = 60
         self.health = 60
+        self.dead = False
 
         self.speed = 220.0
         self.jump_speed = 760.0
 
         self.on_ground = False
-        self.dead = False
-
-        # tiny cooldown so it doesn't spam jump every frame
         self.jump_cd = 0.0
 
     @property
     def rect(self) -> pygame.Rect:
-        # bounding box for collisions
         return pygame.Rect(
             int(self.pos.x - self.radius),
             int(self.pos.y - self.radius),
@@ -47,33 +45,32 @@ class Enemy:
         if self.health <= 0:
             self.dead = True
 
-    def update(self, dt: float, player_rect: pygame.Rect, solids: list[pygame.Rect]):
+    def update(self, dt: float, player_rect: pygame.Rect, solids):
         if self.dead:
             return
 
         self.jump_cd = max(0.0, self.jump_cd - dt)
 
-        # --- horizontal chase ---
-        target_x = player_rect.centerx
-        dx = target_x - self.pos.x
+        # chase horizontally
+        dx = player_rect.centerx - self.pos.x
         move_dir = 0.0
         if abs(dx) > 6:
             move_dir = 1.0 if dx > 0 else -1.0
+
         self.vel.x = move_dir * self.speed
 
-        # --- gravity ---
+        # gravity
         self.vel.y += GRAVITY * dt
         self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
 
-        # --- move/collide ---
+        # move/collide
         self._move_x(dt, solids)
         self._move_y(dt, solids)
 
-        # --- "navigate any map" jump heuristics ---
+        # navigation: jump when blocked or when player above & close
         player_above = player_rect.centery < (self.pos.y - self.radius - TILE_SIZE // 2)
         close_x = abs(player_rect.centerx - self.pos.x) < (TILE_SIZE * 4)
 
-        # If chasing into wall, _move_x will have zeroed vel.x; treat as blocked
         blocked = (move_dir != 0.0 and abs(self.vel.x) < 1e-3)
 
         if self.on_ground and self.jump_cd <= 0.0:
@@ -113,7 +110,12 @@ class Enemy:
         if self.dead:
             return
 
-        cx, cy = camera.apply_point((int(self.pos.x), int(self.pos.y)))
+        # Camera in your project supports apply(rect) (not apply_point),
+        # so just create a rect and use its center.
+        rr = self.rect
+        rr_screen = camera.apply(rr)
+        cx, cy = rr_screen.center
+
         pygame.draw.circle(surf, (240, 120, 120), (cx, cy), self.radius)
 
         # health bar above head
