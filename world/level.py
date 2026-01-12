@@ -51,19 +51,26 @@ class Level:
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
-        # spikes = death
+        # spikes = damage (30 per hit)
         for spike in self.tilemap.spikes:
             if self.player.rect.colliderect(spike):
-                self._respawn()
+                self.player.take_damage(30)
                 break
 
-        # fall off world
-        if self.player.rect.top > self.fall_y:
-            self._respawn()
+        # death condition (0 HP) => respawn + full heal
+        if self.player.health <= 0:
+            self._respawn(full_heal=True)
 
-    def _respawn(self):
+        # fall off world => respawn (no heal unless you want it)
+        if self.player.rect.top > self.fall_y:
+            self._respawn(full_heal=False)
+
+    def _respawn(self, full_heal: bool):
         self.player.rect.topleft = self.respawn_point
         self.player.vel.xy = (0, 0)
+        if full_heal:
+            self.player.health = self.player.max_health
+            self.player.hurt_timer = 0.0  # clear i-frames on respawn
 
     def draw(self, surf, camera):
         self.tilemap.draw(surf, camera)
