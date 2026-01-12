@@ -1,236 +1,403 @@
 # world/loader.py
 import random
+from collections import deque
+
 from core.settings import TILE_SIZE, GRAVITY, JUMP_SPEED, MOVE_SPEED
 
 
+# Tile legend:
+# '.' empty
+# '#' solid
+# 'P' player spawn (treated as empty)
+# '^' spikes (hazard)
+# 'C' crumble (solid for now; can be expanded later)
+# 'M' moving platform (solid for now; can be expanded later)
+
+
 def _single_jump_height_px() -> float:
-    # h = v^2 / (2g)
     return (JUMP_SPEED * JUMP_SPEED) / (2.0 * GRAVITY)
 
 
 def _time_to_apex() -> float:
-    # t = v/g
     return JUMP_SPEED / GRAVITY
 
 
-def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
-    return max(0, min(a1, b1) - max(a0, b0))
+def _rng_seed(seed):
+    return seed if seed is not None else random.randrange(1, 2_000_000_000)
 
 
-def load_demo_level(cols: int = 70, rows: int = 24, seed=None):
+def _in_bounds(x, y, cols, rows):
+    return 0 <= x < cols and 0 <= y < rows
+
+
+def _is_solid(ch: str) -> bool:
+    return ch in ("#", "C", "M")
+
+
+def _is_empty(ch: str) -> bool:
+    return ch in (".", "P", "^")
+
+
+def _place_rect_solid(grid, x0, y0, w, h, ch="#"):
+    rows = len(grid)
+    cols = len(grid[0])
+    for y in range(y0, y0 + h):
+        if not (0 <= y < rows):
+            continue
+        for x in range(x0, x0 + w):
+            if 0 <= x < cols:
+                grid[y][x] = ch
+
+
+def _carve_rect_empty(grid, x0, y0, w, h):
+    rows = len(grid)
+    cols = len(grid[0])
+    for y in range(y0, y0 + h):
+        if not (0 <= y < rows):
+            continue
+        for x in range(x0, x0 + w):
+            if 0 <= x < cols:
+                grid[y][x] = "."
+
+
+def _place_platform(grid, x0, y, length, ch="#"):
+    cols = len(grid[0])
+    x0 = max(1, min(cols - 2, x0))
+    x1 = max(x0 + 2, min(cols - 1, x0 + length))  # exclusive
+    for x in range(x0, x1):
+        grid[y][x] = ch
+    return x0, x1
+
+
+def _top_surface_cells(grid):
+    """Cells (x,y) where player can stand: solid at (x,y) and empty above at (x,y-1)."""
+    rows = len(grid)
+    cols = len(grid[0])
+    tops = []
+    for y in range(1, rows):
+        for x in range(cols):
+            if _is_solid(grid[y][x]) and _is_empty(grid[y - 1][x]):
+                tops.append((x, y - 1))  # standing position is the empty cell above solid
+    return tops
+
+
+def _reachable_validator(grid, spawn_xy, goal_y_max, min_gap_tiles, max_gap_tiles,
+                         max_dx_single, max_dx_double, approx_single_h_tiles):
     """
-    Complex procedural platformer map (Python-only):
-    - Main path guaranteed reachable
-    - Extra random platforms
-    - Walls/columns/shafts
-    - Different every run unless seed provided
+    Graph node = standable cell above a solid.
+    Edge from A->B if B is within (dx, dy) jump envelope.
+    We require a path from spawn to any node with y <= goal_y_max.
     """
-    rng = random.Random(seed)
+    rows = len(grid)
+    cols = len(grid[0])
 
-    # ---------- Jump rules (vertical gaps in tiles) ----------
+    tops = _top_surface_cells(grid)
+    if not tops:
+        return False
+
+    # index tops by y for faster lookup
+    tops_by_y = {}
+    for x, y in tops:
+        tops_by_y.setdefault(y, []).append(x)
+
+    sx, sy = spawn_xy
+
+    # Find nearest standable node to spawn (within a small radius)
+    start = None
+    best_d = 10**9
+    for x, y in tops:
+        d = abs(x - sx) + abs(y - sy)
+        if d < best_d:
+            best_d = d
+            start = (x, y)
+
+    if start is None:
+        return False
+
+    q = deque([start])
+    visited = set([start])
+
+    # Helper: test candidates from a node
+    def neighbors(ax, ay):
+        # Only consider landing higher than current (smaller y), and also small drops
+        # We'll allow mild drops too to avoid “dead ends”.
+        for by in range(max(1, ay - (max_gap_tiles + 2)), min(rows - 1, ay + 6)):
+            if by not in tops_by_y:
+                continue
+            dy = ay - by  # positive means target is higher
+            # Determine if this requires double jump
+            needs_double = dy > approx_single_h_tiles
+            max_dx = max_dx_double if needs_double else max_dx_single
+
+            # Only allow upward within our designed gap band (with a little tolerance),
+            # and downward not too far (drops are okay but limited).
+            if dy > 0:
+                if dy < int(0.70 * min_gap_tiles) or dy > int(1.20 * max_gap_tiles):
+                    continue
+            else:
+                if abs(dy) > 5:
+                    continue
+
+            for bx in tops_by_y[by]:
+                if abs(bx - ax) <= max_dx:
+                    yield (bx, by)
+
+    while q:
+        ax, ay = q.popleft()
+        if ay <= goal_y_max:
+            return True
+        for nb in neighbors(ax, ay):
+            if nb not in visited:
+                visited.add(nb)
+                q.append(nb)
+
+    return False
+
+
+def load_demo_level(cols: int = 80, rows: int = 26, seed=None):
+    """
+    All-in-one generator:
+    1) Rooms + doors
+    2) Biome themes
+    3) Hazards (^), plus crumble (C) and moving (M) placeholders
+    4) Validator to avoid dead ends (regenerates until valid)
+    """
+
+    # ---- Jump / reach numbers ----
     h1 = _single_jump_height_px()
     min_gap_tiles = max(1, int(round((0.75 * h1) / TILE_SIZE)))
     max_gap_tiles = max(min_gap_tiles, int(round((1.50 * h1) / TILE_SIZE)))
+    approx_single_h_tiles = max(1, int(round(h1 / TILE_SIZE)))
 
-    # ---------- Horizontal reach estimate ----------
     t_apex = _time_to_apex()
-    single_air_time = 2.0 * t_apex
-    double_air_time = 4.0 * t_apex  # rough (two jumps)
-    max_dx_single_tiles = max(3, int((MOVE_SPEED * single_air_time) / TILE_SIZE))
-    max_dx_double_tiles = max(max_dx_single_tiles + 2, int((MOVE_SPEED * double_air_time) / TILE_SIZE))
+    single_air = 2.0 * t_apex
+    double_air = 4.0 * t_apex  # rough
+    max_dx_single = max(3, int((MOVE_SPEED * single_air) / TILE_SIZE))
+    max_dx_double = max(max_dx_single + 2, int((MOVE_SPEED * double_air) / TILE_SIZE))
 
-    # ---------- Grid init ----------
-    grid = [["." for _ in range(cols)] for _ in range(rows)]
+    # ---- Biomes (tunes generation) ----
+    biomes = [
+        # name, room_count, extra_plats, spike_density, wall_density, intensity
+        ("ruins",   (4, 6),  (25, 40), 0.06, 0.55, 1.0),
+        ("cavern",  (3, 5),  (35, 55), 0.08, 0.35, 1.2),
+        ("tower",   (5, 8),  (20, 35), 0.05, 0.75, 0.9),
+        ("chaos",   (6, 9),  (45, 75), 0.10, 0.60, 1.4),
+    ]
 
-    # Border walls (keeps camera/world feeling contained)
-    for y in range(rows):
-        grid[y][0] = "#"
-        grid[y][cols - 1] = "#"
+    base_seed = _rng_seed(seed)
 
-    # Ground (2 tiles thick)
+    # ---- Regenerate until valid (no dead ends) ----
+    for attempt in range(60):
+        rng = random.Random(base_seed + attempt * 99991)
+
+        biome = rng.choice(biomes)
+        _, room_range, extra_range, spike_density, wall_density, intensity = biome
+
+        # Grid init
+        grid = [["." for _ in range(cols)] for _ in range(rows)]
+
+        # Border walls
+        for y in range(rows):
+            grid[y][0] = "#"
+            grid[y][cols - 1] = "#"
+
+        # Ground (2 thick)
+        for y in range(rows - 2, rows):
+            for x in range(cols):
+                grid[y][x] = "#"
+
+        # -------- Rooms (solid shells + carved interior) --------
+        room_count = rng.randint(*room_range)
+        rooms = []
+        for _ in range(room_count):
+            w = rng.randint(14, 22)
+            h = rng.randint(8, 12)
+            x0 = rng.randint(2, cols - w - 2)
+            y0 = rng.randint(2, rows - h - 4)
+
+            # outer shell
+            _place_rect_solid(grid, x0, y0, w, h, "#")
+            # carve interior
+            _carve_rect_empty(grid, x0 + 1, y0 + 1, w - 2, h - 2)
+
+            rooms.append((x0, y0, w, h))
+
+            # add a “floor” inside room (platform)
+            floor_y = y0 + h - 2
+            plat_len = rng.randint(max(6, w - 10), w - 2)
+            plat_x = x0 + rng.randint(1, max(1, (w - plat_len - 1)))
+            _place_platform(grid, plat_x, floor_y, plat_len, "#")
+
+        # -------- Doors between rooms (gaps in walls) --------
+        # connect successive rooms with a “door” carved in a wall
+        for i in range(len(rooms) - 1):
+            x0, y0, w0, h0 = rooms[i]
+            x1, y1, w1, h1r = rooms[i + 1]
+
+            # Choose a vertical band where both rooms overlap-ish
+            door_y = rng.randint(max(y0 + 2, y1 + 2), min(y0 + h0 - 3, y1 + h1r - 3))
+            # carve a short horizontal corridor between them
+            ax = x0 + w0 - 1
+            bx = x1
+            if ax > bx:
+                ax, bx = bx, ax
+            for x in range(ax, bx + 1):
+                if 1 <= x <= cols - 2 and 1 <= door_y <= rows - 3:
+                    grid[door_y][x] = "."
+                    grid[door_y - 1][x] = "."
+                    grid[door_y + 1][x] = "."  # makes corridor feel less tight
+
+        # -------- Main intense platform path (guaranteed-ish by validator) --------
+        platform_min_len = 4
+        platform_max_len = int(12 * intensity)
+
+        current_y = rows - 4
+        length = rng.randint(8, max(8, platform_max_len))
+        current_x0 = rng.randint(3, cols - (length + 4))
+        current_x0, current_x1 = _place_platform(grid, current_x0, current_y, length, "#")
+
+        # Spawn
+        spawn_x = min(cols - 3, current_x0 + 2)
+        spawn_y = max(1, current_y - 1)
+        grid[spawn_y][spawn_x] = "P"
+
+        main_path = [(current_y, current_x0, current_x1)]
+        safety = 0
+        max_overlap_ratio = 0.30
+
+        while current_y > 4 and safety < 500:
+            safety += 1
+
+            gap_tiles = rng.randint(min_gap_tiles, max_gap_tiles)
+            next_y = current_y - gap_tiles
+            if next_y < 2:
+                break
+
+            length = rng.randint(platform_min_len, max(6, platform_max_len))
+            below_center = (current_x0 + current_x1) // 2
+
+            needs_double = gap_tiles > approx_single_h_tiles
+            max_dx = max_dx_double if needs_double else max_dx_single
+
+            best = None
+            for _ in range(160):
+                dx = rng.randint(-max_dx, max_dx)
+                cand_center = below_center + dx
+                cand_x0 = cand_center - length // 2
+                cand_x0 = max(2, min(cols - (length + 3), cand_x0))
+                cand_x1 = cand_x0 + length
+
+                # overlap rule with platform below
+                ov = _overlap_len(cand_x0, cand_x1, current_x0, current_x1)
+                overlap_ratio = ov / max(1, (current_x1 - current_x0))
+                if overlap_ratio > max_overlap_ratio:
+                    continue
+
+                # avoid stacking directly inside solid room shells (if solid at same y-1 everywhere)
+                if all(_is_solid(grid[next_y][x]) for x in range(cand_x0, cand_x1)):
+                    continue
+
+                best = (cand_x0, cand_x1)
+                break
+
+            if best is None:
+                # force away placement
+                if below_center < cols // 2:
+                    cand_x0 = rng.randint(cols // 2, cols - (length + 3))
+                else:
+                    cand_x0 = rng.randint(2, max(3, cols // 2 - (length + 2)))
+                cand_x1 = cand_x0 + length
+                best = (cand_x0, cand_x1)
+
+            next_x0, next_x1 = best
+            placed_x0, placed_x1 = _place_platform(grid, next_x0, next_y, length, "#")
+            main_path.append((next_y, placed_x0, placed_x1))
+
+            current_y, current_x0, current_x1 = next_y, placed_x0, placed_x1
+
+        # -------- Extra platforms (more chaos) --------
+        extra_count = rng.randint(*extra_range)
+        for _ in range(extra_count):
+            y = rng.randint(2, rows - 6)
+            length = rng.randint(3, int(10 * intensity))
+            x0 = rng.randint(2, cols - (length + 3))
+
+            # sometimes crumble or moving
+            r = rng.random()
+            if r < 0.10:
+                ch = "C"
+            elif r < 0.16:
+                ch = "M"
+            else:
+                ch = "#"
+
+            _place_platform(grid, x0, y, length, ch)
+
+        # -------- Walls / columns / shafts (with gaps) --------
+        col_count = rng.randint(int(6 * wall_density), int(14 * wall_density + 2))
+        for _ in range(col_count):
+            x = rng.randint(4, cols - 5)
+            y0 = rng.randint(2, rows // 2)
+            y1 = rng.randint(rows // 2, rows - 4)
+
+            # carve a gap near a main path platform so it won't hard-block
+            gap_y = None
+            if main_path and rng.random() < 0.9:
+                py, _, _ = rng.choice(main_path)
+                gap_y = max(2, min(rows - 7, py - rng.randint(0, 2)))
+            gap_h = rng.randint(3, 5)
+
+            for y in range(y0, y1 + 1):
+                if gap_y is not None and gap_y <= y < gap_y + gap_h:
+                    continue
+                grid[y][x] = "#"
+
+            # sometimes thicken
+            if rng.random() < 0.35:
+                xx = x + rng.choice([-1, 1])
+                if 2 <= xx <= cols - 3:
+                    for y in range(y0, y1 + 1):
+                        if gap_y is not None and gap_y <= y < gap_y + gap_h:
+                            continue
+                        grid[y][xx] = "#"
+
+        # -------- Spikes (hazards) --------
+        # place spikes on top of solids (in empty cell above solid),
+        # but avoid the spawn row area for fairness
+        for y in range(2, rows - 3):
+            for x in range(2, cols - 2):
+                if (x - spawn_x) ** 2 + (y - spawn_y) ** 2 < 25:
+                    continue
+                if _is_solid(grid[y][x]) and _is_empty(grid[y - 1][x]) and rng.random() < spike_density:
+                    # spike lives in the empty cell above the solid
+                    grid[y - 1][x] = "^"
+
+        # Ensure 'P' is not treated as solid
+        # (Tilemap will ignore it for solids anyway)
+        # -------- Validate reachability --------
+        # goal: reachable to near top
+        goal_y_max = 4
+
+        ok = _reachable_validator(
+            grid=grid,
+            spawn_xy=(spawn_x, spawn_y),
+            goal_y_max=goal_y_max,
+            min_gap_tiles=min_gap_tiles,
+            max_gap_tiles=max_gap_tiles,
+            max_dx_single=max_dx_single,
+            max_dx_double=max_dx_double,
+            approx_single_h_tiles=approx_single_h_tiles,
+        )
+
+        if ok:
+            return ["".join(row) for row in grid]
+
+    # If somehow we failed all attempts, return a simple fallback
+    fallback = [["." for _ in range(cols)] for _ in range(rows)]
     for y in range(rows - 2, rows):
         for x in range(cols):
-            grid[y][x] = "#"
-
-    # Track platforms by row to prevent same-row overlap
-    platforms_by_row = {}  # y -> list[(x0,x1)]
-
-    def row_has_overlap(y: int, x0: int, x1: int) -> bool:
-        for a0, a1 in platforms_by_row.get(y, []):
-            if _overlap_len(a0, a1, x0, x1) > 0:
-                return True
-        return False
-
-    def record_platform(y: int, x0: int, x1: int):
-        platforms_by_row.setdefault(y, []).append((x0, x1))
-
-    def place_platform(x0: int, y: int, length: int):
-        x0 = max(1, min(cols - 2, x0))
-        x1 = max(x0 + 2, min(cols - 1, x0 + length))  # exclusive
-        for x in range(x0, x1):
-            grid[y][x] = "#"
-        record_platform(y, x0, x1)
-        return x0, x1
-
-    def place_wall_column(x: int, y0: int, y1: int, gap_y=None, gap_h=3):
-        """
-        Solid vertical wall/column from y0..y1 inclusive, with an optional gap.
-        """
-        y0 = max(1, y0)
-        y1 = min(rows - 3, y1)
-        if x <= 0 or x >= cols - 1:
-            return
-
-        for y in range(y0, y1 + 1):
-            if gap_y is not None and gap_y <= y < gap_y + gap_h:
-                continue
-            grid[y][x] = "#"
-
-    # ---------- Main path generation ----------
-    max_overlap_ratio = 0.30
-
-    platform_min_len = 4
-    platform_max_len = 12
-
-    # Start platform near bottom
-    current_y = rows - 4
-    length = rng.randint(7, 12)
-    current_x0 = rng.randint(3, cols - (length + 4))
-    current_x1 = current_x0 + length
-    current_x0, current_x1 = place_platform(current_x0, current_y, length)
-
-    # Player spawn above the first platform
-    spawn_x = min(cols - 3, current_x0 + 2)
-    spawn_y = max(1, current_y - 1)
-    grid[spawn_y][spawn_x] = "P"
-
-    # Keep a list of main path platforms so we can carve gaps in walls later
-    main_path = [(current_y, current_x0, current_x1)]
-
-    safety = 0
-    while current_y > 4 and safety < 400:
-        safety += 1
-
-        gap_tiles = rng.randint(min_gap_tiles, max_gap_tiles)
-        next_y = current_y - gap_tiles
-        if next_y < 2:
-            break
-
-        length = rng.randint(platform_min_len, platform_max_len)
-
-        # Determine whether this jump might require double jump
-        # If gap > ~single jump height in tiles, allow larger horizontal reach.
-        approx_single_h_tiles = max(1, int(round(h1 / TILE_SIZE)))
-        needs_double = gap_tiles > approx_single_h_tiles
-        max_dx = max_dx_double_tiles if needs_double else max_dx_single_tiles
-
-        below_center = (current_x0 + current_x1) // 2
-
-        best = None
-        for _ in range(120):
-            # pick center within reachable dx
-            dx = rng.randint(-max_dx, max_dx)
-            cand_center = below_center + dx
-
-            cand_x0 = cand_center - length // 2
-            cand_x0 = max(2, min(cols - (length + 3), cand_x0))
-            cand_x1 = cand_x0 + length
-
-            # overlap <= 30% relative to below platform
-            ov = _overlap_len(cand_x0, cand_x1, current_x0, current_x1)
-            overlap_ratio = ov / max(1, (current_x1 - current_x0))
-            if overlap_ratio > max_overlap_ratio:
-                continue
-
-            # no same-row overlap
-            if row_has_overlap(next_y, cand_x0, cand_x1):
-                continue
-
-            best = (cand_x0, cand_x1)
-            break
-
-        if best is None:
-            # force a far placement away from below center
-            if below_center < cols // 2:
-                cand_x0 = rng.randint(cols // 2, cols - (length + 3))
-            else:
-                cand_x0 = rng.randint(2, max(3, cols // 2 - (length + 2)))
-            cand_x1 = cand_x0 + length
-            # slide if overlapping on same row
-            tries = 0
-            while row_has_overlap(next_y, cand_x0, cand_x1) and tries < 60:
-                cand_x0 = max(2, min(cols - (length + 3), cand_x0 + rng.choice([-3, 3, -4, 4])))
-                cand_x1 = cand_x0 + length
-                tries += 1
-            best = (cand_x0, cand_x1)
-
-        next_x0, next_x1 = best
-        placed_x0, placed_x1 = place_platform(next_x0, next_y, length)
-
-        main_path.append((next_y, placed_x0, placed_x1))
-
-        current_y = next_y
-        current_x0, current_x1 = placed_x0, placed_x1
-
-    # ---------- Add “intense” random extra platforms ----------
-    extra_count = rng.randint(20, 38)
-    for _ in range(extra_count):
-        y = rng.randint(2, rows - 6)
-        length = rng.randint(3, 10)
-        x0 = rng.randint(2, cols - (length + 3))
-        x1 = x0 + length
-
-        if row_has_overlap(y, x0, x1):
-            continue
-
-        # Don’t let extras overlap too much with a main-path platform directly below (if any)
-        below = None
-        for (py, px0, px1) in main_path:
-            if py > y:
-                continue
-            if py < y:
-                # find the nearest platform below by y distance
-                dy = y - py
-                if dy <= max_gap_tiles + 2:
-                    below = (px0, px1)
-                    break
-        if below is not None:
-            ov = _overlap_len(x0, x1, below[0], below[1])
-            overlap_ratio = ov / max(1, (below[1] - below[0]))
-            if overlap_ratio > 0.30:
-                continue
-
-        place_platform(x0, y, length)
-
-    # ---------- Add walls / columns / shafts ----------
-    # We place columns and carve gaps around main path heights so you don’t get hard-blocked.
-    col_count = rng.randint(6, 12)
-    for _ in range(col_count):
-        x = rng.randint(4, cols - 5)
-
-        # decide wall height range
-        y0 = rng.randint(2, rows // 2)
-        y1 = rng.randint(rows // 2, rows - 4)
-
-        # choose a gap near a random main path platform (doorway)
-        gap_y = None
-        if main_path and rng.random() < 0.85:
-            py, _, _ = rng.choice(main_path)
-            gap_y = max(2, min(rows - 6, py - rng.randint(0, 2)))
-
-        place_wall_column(x, y0, y1, gap_y=gap_y, gap_h=rng.randint(3, 5))
-
-        # sometimes thicken the wall to 2-wide
-        if rng.random() < 0.35:
-            place_wall_column(x + rng.choice([-1, 1]), y0, y1, gap_y=gap_y, gap_h=rng.randint(3, 5))
-
-    # ---------- Sprinkle a few “ledge blocks” (micro platforms) ----------
-    micro = rng.randint(18, 35)
-    for _ in range(micro):
-        y = rng.randint(2, rows - 6)
-        x = rng.randint(2, cols - 3)
-        if grid[y][x] == "." and grid[y + 1][x] == ".":  # avoid stacking on solids
-            # avoid placing inside border walls
-            grid[y][x] = "#"
-
-    return ["".join(r) for r in grid]
+            fallback[y][x] = "#"
+    fallback[rows - 5][4] = "P"
+    for i in range(5, cols - 5, 8):
+        _place_platform(fallback, i, rows - 8, 6, "#")
+    return ["".join(r) for r in fallback]
