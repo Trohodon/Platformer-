@@ -8,6 +8,7 @@ from core.camera import Camera
 from world.level import Level
 from ui.hud import HUD
 
+
 class Game:
     def __init__(self):
         pygame.init()
@@ -26,20 +27,32 @@ class Game:
         self.level = Level()
         self.hud = HUD(self.assets)
 
-        self._jump_requested = False
+        # Jump signals (edge-triggered + held)
+        self._jump_pressed = False
+        self._jump_released = False
+        self._jump_held = False
 
     def run(self):
         while self.running:
             dt = self.clock.tick(FPS) / 1000.0
             if dt > 0.05:
-                dt = 0.05  # prevent huge physics step if window drags
+                dt = 0.05
 
             self._handle_events()
             self.input.update()
 
             # Update world/entities
-            self.level.update(dt, self.input, self._jump_requested)
-            self._jump_requested = False
+            self.level.update(
+                dt,
+                self.input,
+                jump_pressed=self._jump_pressed,
+                jump_released=self._jump_released,
+                jump_held=self._jump_held,
+            )
+
+            # reset one-frame signals
+            self._jump_pressed = False
+            self._jump_released = False
 
             # Camera follows player
             self.camera.update(self.level.player.rect)
@@ -62,4 +75,10 @@ class Game:
                     self.running = False
 
                 if event.key in (pygame.K_SPACE, pygame.K_w, pygame.K_UP):
-                    self._jump_requested = True
+                    self._jump_pressed = True
+                    self._jump_held = True
+
+            elif event.type == pygame.KEYUP:
+                if event.key in (pygame.K_SPACE, pygame.K_w, pygame.K_UP):
+                    self._jump_released = True
+                    self._jump_held = False
