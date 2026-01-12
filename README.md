@@ -1,4 +1,4 @@
-'''platformer/
+```platformer/
 ├── main.py
 ├── core/
 │   ├── __init__.py
@@ -21,4 +21,4 @@
 └── ui/
     ├── __init__.py
     ├── hud.py
-    └── menu.py'''
+    └── menu.py```
