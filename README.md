@@ -1,5 +1,4 @@
-```text
-platformer/
+'''platformer/
 ├── main.py
 ├── core/
 │   ├── __init__.py
@@ -19,12 +18,7 @@ platformer/
 │   ├── player.py
 │   ├── enemy.py
 │   └── coin.py
-├── ui/
-│   ├── __init__.py
-│   ├── hud.py
-│   └── menu.py
-└── assets/
-    ├── images/
-    ├── sounds/
-    └── levels/
-```
+└── ui/
+    ├── __init__.py
+    ├── hud.py
+    └── menu.py'''
