@@ -15,7 +15,13 @@ class Player:
         self.vel = pygame.Vector2(0, 0)
         self.on_ground = False
 
-        # --- Jumping (double jump + nicer feel) ---
+        # ---- Health ----
+        self.max_health = 100
+        self.health = 100
+        self.hurt_iframes = 0.40   # seconds of invulnerability after damage
+        self.hurt_timer = 0.0
+
+        # --- Jumping ---
         self.max_jumps = 2
         self.jumps_left = self.max_jumps
 
@@ -38,7 +44,15 @@ class Player:
         self.dash_timer = 0.0
         self.dash_cooldown = 0.0
         self.air_dashes_left = AIR_DASHES
-        self._dash_dir = 1  # -1 left, +1 right
+        self._dash_dir = 1
+
+    def take_damage(self, amount: int) -> bool:
+        """Returns True if damage was applied."""
+        if self.hurt_timer > 0.0:
+            return False
+        self.health = max(0, self.health - int(amount))
+        self.hurt_timer = self.hurt_iframes
+        return True
 
     def update(self, dt: float, input_state,
                jump_pressed: bool, jump_released: bool, jump_held: bool,
@@ -49,8 +63,9 @@ class Player:
         self.coyote_timer = max(0.0, self.coyote_timer - dt)
         self.dash_cooldown = max(0.0, self.dash_cooldown - dt)
         self.wall_stick_timer = max(0.0, self.wall_stick_timer - dt)
+        self.hurt_timer = max(0.0, self.hurt_timer - dt)
 
-        # --- horizontal intent ---
+        # horizontal intent
         move = 0.0
         if input_state.left():
             move -= 1.0
@@ -60,11 +75,11 @@ class Player:
         if move != 0:
             self._dash_dir = 1 if move > 0 else -1
 
-        # --- jump buffer ---
+        # jump buffer
         if jump_pressed:
             self.jump_buffer_timer = self.jump_buffer_time
 
-        # --- dash trigger ---
+        # dash trigger
         if dash_pressed and (not self.dashing) and self.dash_cooldown <= 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
             if can_dash:
@@ -73,33 +88,24 @@ class Player:
                 self.dash_cooldown = DASH_COOLDOWN
                 if not self.on_ground:
                     self.air_dashes_left -= 1
-
-                # dash velocity (horizontal burst, slight y cancel)
                 self.vel.x = self._dash_dir * DASH_SPEED
                 self.vel.y = 0
 
-        # --- if dashing: limited physics ---
+        # dash physics
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0:
                 self.dashing = False
-            # move while dashing
             self._move_x(dt, solids)
             self._move_y(dt, solids)
-            # landing resets jumps/dashes handled below
         else:
-            # normal movement
             self.vel.x = move * MOVE_SPEED
-
-            # gravity
             self.vel.y += GRAVITY * dt
             self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
-
-            # move & collide
             self._move_x(dt, solids)
             self._move_y(dt, solids)
 
-        # update wall contact flags (after movement)
+        # update wall flags
         self._update_wall_flags(solids)
 
         # coyote time
@@ -111,38 +117,31 @@ class Player:
             self.jumps_left = self.max_jumps
             self.air_dashes_left = AIR_DASHES
 
-        # wall stick timer when contacting wall in air
+        # wall stick when contacting wall in air while falling
         if (self.on_wall_left or self.on_wall_right) and (not self.on_ground) and self.vel.y > 0:
             self.wall_stick_timer = WALL_STICK_TIME
 
-        # wall slide (only if holding INTO wall and falling)
-        holding_into_left = input_state.left()
-        holding_into_right = input_state.right()
+        # wall slide
         sliding = False
-
         if not self.on_ground and self.vel.y > 0:
-            if self.on_wall_left and holding_into_left:
+            if self.on_wall_left and input_state.left():
                 sliding = True
-            if self.on_wall_right and holding_into_right:
+            if self.on_wall_right and input_state.right():
                 sliding = True
-
         if sliding:
             self.vel.y = min(self.vel.y, WALL_SLIDE_SPEED)
 
         # consume buffered jump
         if self.jump_buffer_timer > 0.0:
-            # wall jump has priority if on wall and not grounded
             if not self.on_ground and (self.on_wall_left or self.on_wall_right) and self.wall_stick_timer > 0.0:
                 self._do_wall_jump()
                 self.jump_buffer_timer = 0.0
                 self.coyote_timer = 0.0
             else:
-                # ground/coyote jump
                 if (self.on_ground or self.coyote_timer > 0.0) and self.jumps_left > 0:
                     self._do_jump()
                     self.jump_buffer_timer = 0.0
                     self.coyote_timer = 0.0
-                # air jump (double jump)
                 elif (not self.on_ground) and self.jumps_left > 0:
                     self._do_jump()
                     self.jump_buffer_timer = 0.0
@@ -152,8 +151,6 @@ class Player:
             self.vel.y *= self.jump_cut_multiplier
 
         self.was_on_ground = self.on_ground
-
-    # ---------------- movement/collision ----------------
 
     def _move_x(self, dt: float, solids):
         self.rect.x += int(self.vel.x * dt)
@@ -168,7 +165,6 @@ class Player:
     def _move_y(self, dt: float, solids):
         self.rect.y += int(self.vel.y * dt)
         self.on_ground = False
-
         for s in solids:
             if self.rect.colliderect(s):
                 if self.vel.y > 0:
@@ -182,14 +178,10 @@ class Player:
     def _update_wall_flags(self, solids):
         self.on_wall_left = False
         self.on_wall_right = False
-
         if self.on_ground:
             return
-
-        # probe 1px left/right
         left_probe = self.rect.move(-1, 0)
         right_probe = self.rect.move(1, 0)
-
         for s in solids:
             if left_probe.colliderect(s):
                 self.on_wall_left = True
@@ -198,25 +190,18 @@ class Player:
             if self.on_wall_left and self.on_wall_right:
                 break
 
-    # ---------------- actions ----------------
-
     def _do_jump(self):
         self.vel.y = -JUMP_SPEED
         self.on_ground = False
         self.jumps_left -= 1
 
     def _do_wall_jump(self):
-        # push away from wall
         if self.on_wall_left:
             self.vel.x = WALL_JUMP_X
         elif self.on_wall_right:
             self.vel.x = -WALL_JUMP_X
         self.vel.y = -WALL_JUMP_Y
-
-        # reset wall stick so you don't re-stick instantly
         self.wall_stick_timer = 0.0
-
-        # wall jump consumes a jump "slot" (feels fair)
         if self.jumps_left == self.max_jumps:
             self.jumps_left -= 1
 
