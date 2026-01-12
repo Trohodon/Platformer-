@@ -21,11 +21,12 @@ class Bullet:
             self.radius * 2
         )
 
-    def update(self, dt: float, solids: list[pygame.Rect]):
+    def update(self, dt: float, solids):
         if not self.alive:
             return
+
         self.life -= dt
-        if self.life <= 0:
+        if self.life <= 0.0:
             self.alive = False
             return
 
@@ -40,5 +41,10 @@ class Bullet:
     def draw(self, surf: pygame.Surface, camera):
         if not self.alive:
             return
-        cx, cy = camera.apply_point((int(self.pos.x), int(self.pos.y)))
+
+        # Your Camera supports apply(rect), not apply_point
+        rr = self.rect
+        rr_screen = camera.apply(rr)
+        cx, cy = rr_screen.center
+
         pygame.draw.circle(surf, (220, 220, 120), (cx, cy), self.radius)
