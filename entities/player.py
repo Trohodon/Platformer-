@@ -7,6 +7,7 @@ from core.settings import (
     WALL_SLIDE_SPEED, WALL_JUMP_X, WALL_JUMP_Y, WALL_STICK_TIME
 )
 from core.utils import clamp
+from entities.bullet import Bullet
 
 
 class Player:
@@ -18,8 +19,14 @@ class Player:
         # ---- Health ----
         self.max_health = 100
         self.health = 100
-        self.hurt_iframes = 0.40   # seconds of invulnerability after damage
+        self.hurt_iframes = 0.40
         self.hurt_timer = 0.0
+
+        # ---- Weapon ----
+        self.shoot_cd = 0.0
+        self.shoot_rate = 0.18  # seconds between shots
+        self.shot_speed = 900.0
+        self.facing = 1  # -1 left, +1 right
 
         # --- Jumping ---
         self.max_jumps = 2
@@ -47,12 +54,24 @@ class Player:
         self._dash_dir = 1
 
     def take_damage(self, amount: int) -> bool:
-        """Returns True if damage was applied."""
         if self.hurt_timer > 0.0:
             return False
         self.health = max(0, self.health - int(amount))
         self.hurt_timer = self.hurt_iframes
         return True
+
+    def try_shoot(self) -> Bullet | None:
+        if self.shoot_cd > 0.0:
+            return None
+        self.shoot_cd = self.shoot_rate
+
+        # Spawn bullet from chest area
+        bx = self.rect.centerx + (self.facing * (self.rect.width // 2 + 6))
+        by = self.rect.centery - 6
+
+        vx = self.facing * self.shot_speed
+        vy = 0.0
+        return Bullet(bx, by, vx, vy, damage=20)
 
     def update(self, dt: float, input_state,
                jump_pressed: bool, jump_released: bool, jump_held: bool,
@@ -64,6 +83,7 @@ class Player:
         self.dash_cooldown = max(0.0, self.dash_cooldown - dt)
         self.wall_stick_timer = max(0.0, self.wall_stick_timer - dt)
         self.hurt_timer = max(0.0, self.hurt_timer - dt)
+        self.shoot_cd = max(0.0, self.shoot_cd - dt)
 
         # horizontal intent
         move = 0.0
@@ -73,13 +93,14 @@ class Player:
             move += 1.0
 
         if move != 0:
-            self._dash_dir = 1 if move > 0 else -1
+            self.facing = 1 if move > 0 else -1
+            self._dash_dir = self.facing
 
         # jump buffer
         if jump_pressed:
             self.jump_buffer_timer = self.jump_buffer_time
 
-        # dash trigger
+        # dash
         if dash_pressed and (not self.dashing) and self.dash_cooldown <= 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
             if can_dash:
@@ -105,7 +126,7 @@ class Player:
             self._move_x(dt, solids)
             self._move_y(dt, solids)
 
-        # update wall flags
+        # wall flags
         self._update_wall_flags(solids)
 
         # coyote time
