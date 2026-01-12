@@ -1,5 +1,6 @@
 # entities/player.py
 import pygame
+from typing import Optional
 
 from core.settings import (
     GRAVITY, MAX_FALL_SPEED, MOVE_SPEED, JUMP_SPEED, PLAYER_COLOR,
@@ -16,19 +17,19 @@ class Player:
         self.vel = pygame.Vector2(0, 0)
         self.on_ground = False
 
-        # ---- Health ----
+        # ---------- Health ----------
         self.max_health = 100
         self.health = 100
         self.hurt_iframes = 0.40
         self.hurt_timer = 0.0
 
-        # ---- Weapon ----
+        # ---------- Weapon ----------
         self.shoot_cd = 0.0
-        self.shoot_rate = 0.18  # seconds between shots
+        self.shoot_rate = 0.18
         self.shot_speed = 900.0
         self.facing = 1  # -1 left, +1 right
 
-        # --- Jumping ---
+        # ---------- Jumping ----------
         self.max_jumps = 2
         self.jumps_left = self.max_jumps
 
@@ -41,18 +42,21 @@ class Player:
         self.jump_cut_multiplier = 0.45
         self.was_on_ground = False
 
-        # --- Wall state ---
+        # ---------- Wall ----------
         self.on_wall_left = False
         self.on_wall_right = False
         self.wall_stick_timer = 0.0
 
-        # --- Dash state ---
+        # ---------- Dash ----------
         self.dashing = False
         self.dash_timer = 0.0
         self.dash_cooldown = 0.0
         self.air_dashes_left = AIR_DASHES
         self._dash_dir = 1
 
+    # ==========================================================
+    # Combat
+    # ==========================================================
     def take_damage(self, amount: int) -> bool:
         if self.hurt_timer > 0.0:
             return False
@@ -60,23 +64,33 @@ class Player:
         self.hurt_timer = self.hurt_iframes
         return True
 
-    def try_shoot(self) -> Bullet | None:
+    def try_shoot(self) -> Optional["Bullet"]:
         if self.shoot_cd > 0.0:
             return None
+
         self.shoot_cd = self.shoot_rate
 
-        # Spawn bullet from chest area
         bx = self.rect.centerx + (self.facing * (self.rect.width // 2 + 6))
         by = self.rect.centery - 6
 
         vx = self.facing * self.shot_speed
         vy = 0.0
+
         return Bullet(bx, by, vx, vy, damage=20)
 
-    def update(self, dt: float, input_state,
-               jump_pressed: bool, jump_released: bool, jump_held: bool,
-               dash_pressed: bool, solids):
-
+    # ==========================================================
+    # Update Loop
+    # ==========================================================
+    def update(
+        self,
+        dt: float,
+        input_state,
+        jump_pressed: bool,
+        jump_released: bool,
+        jump_held: bool,
+        dash_pressed: bool,
+        solids
+    ):
         # timers
         self.jump_buffer_timer = max(0.0, self.jump_buffer_timer - dt)
         self.coyote_timer = max(0.0, self.coyote_timer - dt)
@@ -85,7 +99,7 @@ class Player:
         self.hurt_timer = max(0.0, self.hurt_timer - dt)
         self.shoot_cd = max(0.0, self.shoot_cd - dt)
 
-        # horizontal intent
+        # horizontal input
         move = 0.0
         if input_state.left():
             move -= 1.0
@@ -110,12 +124,12 @@ class Player:
                 if not self.on_ground:
                     self.air_dashes_left -= 1
                 self.vel.x = self._dash_dir * DASH_SPEED
-                self.vel.y = 0
+                self.vel.y = 0.0
 
-        # dash physics
+        # physics
         if self.dashing:
             self.dash_timer -= dt
-            if self.dash_timer <= 0:
+            if self.dash_timer <= 0.0:
                 self.dashing = False
             self._move_x(dt, solids)
             self._move_y(dt, solids)
@@ -126,7 +140,7 @@ class Player:
             self._move_x(dt, solids)
             self._move_y(dt, solids)
 
-        # wall flags
+        # wall detection
         self._update_wall_flags(solids)
 
         # coyote time
@@ -138,19 +152,16 @@ class Player:
             self.jumps_left = self.max_jumps
             self.air_dashes_left = AIR_DASHES
 
-        # wall stick when contacting wall in air while falling
-        if (self.on_wall_left or self.on_wall_right) and (not self.on_ground) and self.vel.y > 0:
+        # wall stick
+        if (self.on_wall_left or self.on_wall_right) and not self.on_ground and self.vel.y > 0:
             self.wall_stick_timer = WALL_STICK_TIME
 
         # wall slide
-        sliding = False
         if not self.on_ground and self.vel.y > 0:
-            if self.on_wall_left and input_state.left():
-                sliding = True
-            if self.on_wall_right and input_state.right():
-                sliding = True
-        if sliding:
-            self.vel.y = min(self.vel.y, WALL_SLIDE_SPEED)
+            if (self.on_wall_left and input_state.left()) or (
+                self.on_wall_right and input_state.right()
+            ):
+                self.vel.y = min(self.vel.y, WALL_SLIDE_SPEED)
 
         # consume buffered jump
         if self.jump_buffer_timer > 0.0:
@@ -163,7 +174,7 @@ class Player:
                     self._do_jump()
                     self.jump_buffer_timer = 0.0
                     self.coyote_timer = 0.0
-                elif (not self.on_ground) and self.jumps_left > 0:
+                elif not self.on_ground and self.jumps_left > 0:
                     self._do_jump()
                     self.jump_buffer_timer = 0.0
 
@@ -173,6 +184,9 @@ class Player:
 
         self.was_on_ground = self.on_ground
 
+    # ==========================================================
+    # Movement helpers
+    # ==========================================================
     def _move_x(self, dt: float, solids):
         self.rect.x += int(self.vel.x * dt)
         for s in solids:
@@ -181,7 +195,7 @@ class Player:
                     self.rect.right = s.left
                 elif self.vel.x < 0:
                     self.rect.left = s.right
-                self.vel.x = 0
+                self.vel.x = 0.0
 
     def _move_y(self, dt: float, solids):
         self.rect.y += int(self.vel.y * dt)
@@ -190,19 +204,21 @@ class Player:
             if self.rect.colliderect(s):
                 if self.vel.y > 0:
                     self.rect.bottom = s.top
-                    self.vel.y = 0
+                    self.vel.y = 0.0
                     self.on_ground = True
                 elif self.vel.y < 0:
                     self.rect.top = s.bottom
-                    self.vel.y = 0
+                    self.vel.y = 0.0
 
     def _update_wall_flags(self, solids):
         self.on_wall_left = False
         self.on_wall_right = False
         if self.on_ground:
             return
+
         left_probe = self.rect.move(-1, 0)
         right_probe = self.rect.move(1, 0)
+
         for s in solids:
             if left_probe.colliderect(s):
                 self.on_wall_left = True
@@ -226,5 +242,8 @@ class Player:
         if self.jumps_left == self.max_jumps:
             self.jumps_left -= 1
 
+    # ==========================================================
+    # Draw
+    # ==========================================================
     def draw(self, surf: pygame.Surface, camera):
         pygame.draw.rect(surf, PLAYER_COLOR, camera.apply(self.rect))
