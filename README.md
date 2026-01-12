@@ -1,3 +1,4 @@
+```text
 platformer/
 ├── main.py
 ├── core/
@@ -26,3 +27,4 @@ platformer/
     ├── images/
     ├── sounds/
     └── levels/
+```
