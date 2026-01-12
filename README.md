@@ -1,4 +1,4 @@
-# Platformer-
+# Platforme
 platformer/
   main.py
 
