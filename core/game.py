@@ -27,13 +27,14 @@ class Game:
         self.level = Level()
         self.hud = HUD(self.assets)
 
-        # Jump signals
         self._jump_pressed = False
         self._jump_released = False
         self._jump_held = False
 
-        # Dash signal (pressed this frame)
         self._dash_pressed = False
+
+        # NEW: shoot (J / K, and left mouse)
+        self._shoot_pressed = False
 
     def run(self):
         while self.running:
@@ -51,12 +52,13 @@ class Game:
                 jump_released=self._jump_released,
                 jump_held=self._jump_held,
                 dash_pressed=self._dash_pressed,
+                shoot_pressed=self._shoot_pressed,
             )
 
-            # reset one-frame signals
             self._jump_pressed = False
             self._jump_released = False
             self._dash_pressed = False
+            self._shoot_pressed = False
 
             self.camera.update(self.level.player.rect)
 
@@ -83,7 +85,14 @@ class Game:
                 if event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
                     self._dash_pressed = True
 
+                if event.key in (pygame.K_j, pygame.K_k):
+                    self._shoot_pressed = True
+
             elif event.type == pygame.KEYUP:
                 if event.key in (pygame.K_SPACE, pygame.K_w, pygame.K_UP):
                     self._jump_released = True
                     self._jump_held = False
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    self._shoot_pressed = True
