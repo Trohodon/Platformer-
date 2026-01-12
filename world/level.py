@@ -1,6 +1,5 @@
 # world/level.py
 import pygame
-
 from core.settings import TILE_SIZE
 from world.loader import load_demo_level
 from world.tilemap import Tilemap
@@ -44,18 +43,27 @@ class Level:
             solids=solids
         )
 
-        # World clamp
+        # clamp to world horizontally
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
-        # Checkpoint
+        # checkpoint when grounded
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
-        # Respawn if fall
+        # spikes = death
+        for spike in self.tilemap.spikes:
+            if self.player.rect.colliderect(spike):
+                self._respawn()
+                break
+
+        # fall off world
         if self.player.rect.top > self.fall_y:
-            self.player.rect.topleft = self.respawn_point
-            self.player.vel.xy = (0, 0)
+            self._respawn()
+
+    def _respawn(self):
+        self.player.rect.topleft = self.respawn_point
+        self.player.vel.xy = (0, 0)
 
     def draw(self, surf, camera):
         self.tilemap.draw(surf, camera)
