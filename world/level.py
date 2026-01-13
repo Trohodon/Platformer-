@@ -1,4 +1,4 @@
-# world/level.py  (FULL FILE update: clamp + respawn enemies that leave the world)
+# world/level.py  (FULL FILE update using WaveManager + wave definitions)
 import pygame
 import random
 
@@ -7,6 +7,9 @@ from world.loader import load_demo_level
 from world.tilemap import Tilemap
 from entities.player import Player
 from entities.enemy import Enemy
+
+from world.waves import WaveManager
+from world.wave_defs import WAVES
 
 
 class Level:
@@ -24,15 +27,15 @@ class Level:
         self.enemies = []
         self.bullets = []
 
-        # waves
-        self.wave_index = 0
-        self.wave_active = False
-        self.wave_cooldown = 1.2
-        self.wave_timer = 0.6
-
         # drop-in spawning
         self.spawn_y = -TILE_SIZE * 6
         self.drop_points = self._build_drop_points()
+
+        # dedicated wave system
+        self.waves = WaveManager(WAVES, cooldown=1.2)
+
+        # deterministic per-run RNG for spawn picking
+        self._spawn_rng = random.Random(12345)
 
     def _compute_world_rect(self) -> pygame.Rect:
         rows = len(self.grid)
@@ -72,38 +75,63 @@ class Level:
         filtered = [wx for wx in points if abs(wx - px) > min_dx]
         return filtered if len(filtered) >= 6 else points
 
-    def _start_next_wave(self):
-        self.wave_index += 1
-        self.wave_active = True
-
-        base = 6
-        add = min(22, self.wave_index * 2)
-        count = min(34, base + add)
-
-        rng = random.Random(self.wave_index * 99173)
-        if not self.drop_points:
+    # ------------------------------------------------------------
+    # Wave Spawning
+    # ------------------------------------------------------------
+    def _spawn_wave(self):
+        wave_def = self.waves.current_wave_def()
+        if wave_def is None:
             return
 
-        hubs = [self.drop_points[rng.randrange(len(self.drop_points))] for _ in range(rng.randint(2, 3))]
+        # seed RNG from wave number so wave spawns feel stable
+        self._spawn_rng = random.Random(self.waves.wave_number * 99991 + 1337)
+
+        # choose 2-3 hubs so enemies pour in from "areas"
+        if not self.drop_points:
+            return
+        hubs = [self.drop_points[self._spawn_rng.randrange(len(self.drop_points))] for _ in range(self._spawn_rng.randint(2, 3))]
 
         def pick_drop_x():
-            hx = hubs[rng.randrange(len(hubs))]
+            hx = hubs[self._spawn_rng.randrange(len(hubs))]
             idx = min(range(len(self.drop_points)), key=lambda i: abs(self.drop_points[i] - hx))
-            spread = rng.randint(2, 6)
-            j = clamp_int(idx + rng.randint(-spread, spread), 0, len(self.drop_points) - 1)
+            spread = self._spawn_rng.randint(2, 6)
+            j = clamp_int(idx + self._spawn_rng.randint(-spread, spread), 0, len(self.drop_points) - 1)
             return self.drop_points[j]
 
-        self.enemies.clear()
+        # spawn entries
+        spawn_list = []
+        for entry in wave_def.get("entries", []):
+            etype = entry.get("type", "basic")
+            count = int(entry.get("count", 0))
+            for _ in range(count):
+                spawn_list.append(etype)
 
-        for i in range(count):
-            ex = pick_drop_x() + rng.randint(-10, 10)
+        # stagger y so they don't overlap instantly
+        for i, etype in enumerate(spawn_list):
+            ex = pick_drop_x() + self._spawn_rng.randint(-10, 10)
             ey = self.spawn_y - i * 10
-            self.enemies.append(Enemy(ex, ey, radius=16))
 
+            enemy = self._create_enemy(etype, ex, ey)
+            self.enemies.append(enemy)
+
+        self.waves.mark_wave_started()
+
+    def _create_enemy(self, etype: str, x: float, y: float):
+        # Future-proof: add new enemy classes here later.
+        # For now, everything maps to Enemy (basic).
+        if etype == "basic":
+            return Enemy(x, y, radius=16)
+
+        # fallback
+        return Enemy(x, y, radius=16)
+
+    # ------------------------------------------------------------
+    # Update
+    # ------------------------------------------------------------
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
         solids = self.tilemap.get_solid_rects_near(self.player.rect)
 
-        # ---------------- Player ----------------
+        # player
         self.player.update(
             dt,
             input_state,
@@ -119,33 +147,31 @@ class Level:
             if b is not None:
                 self.bullets.append(b)
 
-        # clamp player to world
+        # clamp player
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
+        # spikes damage
         for spike in self.tilemap.spikes:
             if self.player.rect.colliderect(spike):
                 self.player.take_damage(30)
                 break
 
-        # ---------------- Waves ----------------
-        if not self.wave_active:
-            self.wave_timer -= dt
-            if self.wave_timer <= 0.0:
-                self._start_next_wave()
-        else:
-            if len([e for e in self.enemies if not e.dead]) == 0:
-                self.wave_active = False
-                self.wave_timer = self.wave_cooldown
-                self.enemies.clear()
+        # ---- wave manager ----
+        alive_enemies = len([e for e in self.enemies if not e.dead])
+        start_new = self.waves.update(dt, alive_enemies)
+        if start_new:
+            self.enemies.clear()
+            self._spawn_wave()
 
-        # ---------------- Bullets ----------------
+        # bullets
         for b in self.bullets:
             b.update(dt, solids)
 
+        # bullet vs enemy
         for b in self.bullets:
             if not b.alive:
                 continue
@@ -158,19 +184,17 @@ class Level:
                     b.alive = False
                     break
 
-        # ---------------- Enemies ----------------
+        # enemies
         for e in self.enemies:
             e.update(dt, self.player.rect, solids, self.grid, self.enemies)
 
-            # HARD CLAMP X so dashes cannot push them outside the world
+            # clamp x so dash can't push them out
             if e.pos.x < self.world_rect.left + e.radius:
                 e.pos.x = self.world_rect.left + e.radius
                 e.vel.x = 0.0
-                # cancel dash if it was driving them out
                 if getattr(e, "dashing", False):
                     e.dashing = False
                     e.dash_timer = 0.0
-
             if e.pos.x > self.world_rect.right - e.radius:
                 e.pos.x = self.world_rect.right - e.radius
                 e.vel.x = 0.0
@@ -181,7 +205,7 @@ class Level:
         # solid enemy-vs-enemy
         self._resolve_enemy_collisions()
 
-        # respawn enemies that fall out of the arena
+        # respawn fallen enemies (keep wave intact)
         self._respawn_fallen_enemies()
 
         # cleanup
@@ -227,19 +251,16 @@ class Level:
         if not self.drop_points:
             return
 
-        rng = random.Random(self.wave_index * 2467 + 1337)
+        rng = self._spawn_rng
 
         for e in self.enemies:
             if e.dead:
                 continue
-
-            # if they fell below the world, respawn above
             if e.rect.top > self.fall_y:
                 ex = self.drop_points[rng.randrange(len(self.drop_points))] + rng.randint(-10, 10)
                 e.pos.update(ex, self.spawn_y)
                 e.vel.update(0, 0)
 
-                # reset enemy "player-like" movement states if present
                 if hasattr(e, "dashing"):
                     e.dashing = False
                 if hasattr(e, "dash_timer"):
@@ -264,13 +285,10 @@ class Level:
 
     def draw(self, surf, camera):
         self.tilemap.draw(surf, camera)
-
         for b in self.bullets:
             b.draw(surf, camera)
-
         for e in self.enemies:
             e.draw(surf, camera)
-
         self.player.draw(surf, camera)
 
 
