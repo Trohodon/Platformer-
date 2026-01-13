@@ -30,7 +30,9 @@ class Level:
         self.wave_cooldown = 1.2
         self.wave_timer = 0.6
 
-        self.spawn_points = self._build_enemy_spawn_points()
+        # spawn behavior (drop-in)
+        self.spawn_y = -TILE_SIZE * 6
+        self.drop_points = self._build_drop_points()
 
     def _compute_world_rect(self) -> pygame.Rect:
         rows = len(self.grid)
@@ -44,21 +46,42 @@ class Level:
                     return pygame.Vector2(x * TILE_SIZE + 8, y * TILE_SIZE + 2)
         return pygame.Vector2(TILE_SIZE * 2, TILE_SIZE * 2)
 
-    def _build_enemy_spawn_points(self):
-        points = []
-        for y, row in enumerate(self.grid):
-            for x, ch in enumerate(row):
-                if ch in ("#", "C", "M") and y > 0:
-                    above = self.grid[y - 1][x]
-                    if above in (".", "^", "P"):
-                        wx = x * TILE_SIZE + TILE_SIZE // 2
-                        wy = (y - 1) * TILE_SIZE + TILE_SIZE // 2
-                        points.append((wx, wy))
+    # ------------------------------------------------------------
+    # NEW: drop-in spawn points (columns that are "open enough")
+    # ------------------------------------------------------------
+    def _build_drop_points(self):
+        rows = len(self.grid)
+        cols = len(self.grid[0]) if rows else 0
+        if rows == 0 or cols == 0:
+            return []
 
-        sx, sy = self.player.rect.centerx, self.player.rect.centery
-        min_d2 = (TILE_SIZE * 10) ** 2
-        points = [p for p in points if (p[0] - sx) ** 2 + (p[1] - sy) ** 2 > min_d2]
-        points.sort(key=lambda p: p[1], reverse=True)
+        # precompute columns where the top N tiles are not solid
+        # so we can spawn above and they will fall into the arena
+        open_cols = []
+        check_depth = min(12, rows)  # only need to ensure a short "air lane"
+
+        solids = {"#", "C", "M"}  # must match your tile solids
+        for x in range(cols):
+            blocked = False
+            for y in range(check_depth):
+                if self.grid[y][x] in solids:
+                    blocked = True
+                    break
+            if not blocked:
+                open_cols.append(x)
+
+        # convert to world X positions centered on tile
+        points = [x * TILE_SIZE + TILE_SIZE // 2 for x in open_cols]
+
+        # keep drops away from player spawn area a bit (reduce insta-pile on player)
+        px = self.player.rect.centerx
+        min_dx = TILE_SIZE * 6
+        points = [wx for wx in points if abs(wx - px) > min_dx]
+
+        # fallback: if filtering removed too many, keep all
+        if len(points) < 6:
+            points = [x * TILE_SIZE + TILE_SIZE // 2 for x in open_cols]
+
         return points
 
     def _start_next_wave(self):
@@ -67,25 +90,34 @@ class Level:
 
         base = 6
         add = min(22, self.wave_index * 2)
-        count = min(32, base + add)
+        count = min(34, base + add)
 
         rng = random.Random(self.wave_index * 99173)
-        points = self.spawn_points[:]
-        if not points:
+
+        # if no drop points, just don't spawn
+        if not self.drop_points:
             return
 
-        hubs = [points[rng.randrange(0, min(len(points), 60))] for _ in range(rng.randint(2, 3))]
+        # choose 2-3 drop hubs so waves "pour in" from areas
+        hubs = [self.drop_points[rng.randrange(len(self.drop_points))] for _ in range(rng.randint(2, 3))]
 
-        def pick_point():
-            hx, hy = hubs[rng.randrange(len(hubs))]
-            px, py = points[rng.randrange(0, len(points))]
-            px = int((px + hx) * 0.5)
-            py = int((py + hy) * 0.5)
-            return px, py
+        def pick_drop_x():
+            hx = hubs[rng.randrange(len(hubs))]
+            # pick a nearby x from the list (by nearest index)
+            idx = min(range(len(self.drop_points)), key=lambda i: abs(self.drop_points[i] - hx))
+            spread = rng.randint(2, 6)
+            j = clamp_int(idx + rng.randint(-spread, spread), 0, len(self.drop_points) - 1)
+            return self.drop_points[j]
 
         self.enemies.clear()
-        for _ in range(count):
-            ex, ey = pick_point()
+
+        for i in range(count):
+            ex = pick_drop_x()
+
+            # slight horizontal jitter so they don't spawn perfectly stacked
+            ex += rng.randint(-10, 10)
+
+            ey = self.spawn_y - i * 10  # stagger vertically so they don't overlap instantly
             self.enemies.append(Enemy(ex, ey, radius=16))
 
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
@@ -154,7 +186,7 @@ class Level:
         for e in self.enemies:
             e.update(dt, self.player.rect, solids, self.grid, self.enemies)
 
-        # SOLID enemy-vs-enemy resolution (prevents blob stacking)
+        # SOLID enemy-vs-enemy resolution
         self._resolve_enemy_collisions()
 
         # cleanup
@@ -170,7 +202,6 @@ class Level:
             self._respawn(full_heal=False)
 
     def _resolve_enemy_collisions(self):
-        # Pairwise circle separation to keep enemies "solid"
         n = len(self.enemies)
         for i in range(n):
             a = self.enemies[i]
@@ -186,20 +217,15 @@ class Level:
                 min_dist = a.radius + b.radius
 
                 if dist <= 0.001:
-                    # nudge apart deterministically
                     d = pygame.Vector2(1, 0)
                     dist = 1.0
 
                 if dist < min_dist:
                     overlap = (min_dist - dist)
                     nrm = d / dist
-
-                    # push each away half the overlap
                     push = nrm * (overlap * 0.5)
                     a.pos -= push
                     b.pos += push
-
-                    # dampen horizontal velocity a bit to avoid jitter
                     a.vel.x *= 0.95
                     b.vel.x *= 0.95
 
@@ -220,3 +246,7 @@ class Level:
             e.draw(surf, camera)
 
         self.player.draw(surf, camera)
+
+
+def clamp_int(v: int, lo: int, hi: int) -> int:
+    return lo if v < lo else hi if v > hi else v
