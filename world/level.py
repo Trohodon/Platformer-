@@ -1,5 +1,7 @@
 # world/level.py
 import pygame
+import random
+
 from core.settings import TILE_SIZE
 from world.loader import load_demo_level
 from world.tilemap import Tilemap
@@ -19,11 +21,18 @@ class Level:
         self.respawn_point = pygame.Vector2(spawn)
         self.fall_y = self.world_rect.bottom + TILE_SIZE * 6
 
-        # Enemies + bullets
-        self.enemies: list[Enemy] = []
-        self.bullets = []  # list[Bullet]
+        # bullets / enemies
+        self.enemies = []
+        self.bullets = []
 
-        self._spawn_enemies()
+        # -------- Waves --------
+        self.wave_index = 0
+        self.wave_active = False
+        self.wave_cooldown = 1.2   # delay between waves
+        self.wave_timer = 0.6
+
+        # Precompute enemy spawn candidates from this map
+        self.spawn_points = self._build_enemy_spawn_points()
 
     def _compute_world_rect(self) -> pygame.Rect:
         rows = len(self.grid)
@@ -37,9 +46,8 @@ class Level:
                     return pygame.Vector2(x * TILE_SIZE + 8, y * TILE_SIZE + 2)
         return pygame.Vector2(TILE_SIZE * 2, TILE_SIZE * 2)
 
-    def _spawn_enemies(self):
-        # spawn enemies on valid "standable" spots (empty above solid)
-        candidates = []
+    def _build_enemy_spawn_points(self):
+        points = []
         for y, row in enumerate(self.grid):
             for x, ch in enumerate(row):
                 if ch in ("#", "C", "M") and y > 0:
@@ -47,23 +55,54 @@ class Level:
                     if above in (".", "^", "P"):
                         wx = x * TILE_SIZE + TILE_SIZE // 2
                         wy = (y - 1) * TILE_SIZE + TILE_SIZE // 2
-                        candidates.append((wx, wy))
+                        points.append((wx, wy))
 
-        # pick some, but keep them away from spawn
+        # keep points away from player spawn
         sx, sy = self.player.rect.centerx, self.player.rect.centery
-        candidates = [c for c in candidates if (c[0] - sx) ** 2 + (c[1] - sy) ** 2 > (TILE_SIZE * 8) ** 2]
+        min_d2 = (TILE_SIZE * 10) ** 2
+        points = [p for p in points if (p[0] - sx) ** 2 + (p[1] - sy) ** 2 > min_d2]
 
-        # cap enemy count for performance
-        count = min(18, max(6, len(candidates) // 30))
+        # prefer "lower" spawns so waves rise at player
+        points.sort(key=lambda p: p[1], reverse=True)
+        return points
+
+    def _start_next_wave(self):
+        self.wave_index += 1
+        self.wave_active = True
+
+        # scale enemy count by wave, with a cap
+        base = 6
+        add = min(18, self.wave_index * 2)
+        count = min(28, base + add)
+
+        # choose spawn points clustered in a couple areas to feel like "waves"
+        rng = random.Random(self.wave_index * 99173)
+        points = self.spawn_points[:]
+        if not points:
+            return
+
+        # pick 2-3 "spawn hubs"
+        hubs = [points[rng.randrange(0, min(len(points), 60))] for _ in range(rng.randint(2, 3))]
+
+        def pick_point():
+            hx, hy = hubs[rng.randrange(len(hubs))]
+            # pick a point near hub by index proximity (since sorted by y)
+            idx = rng.randrange(0, len(points))
+            px, py = points[idx]
+            # nudge toward hub a bit
+            px = int((px + hx) * 0.5)
+            py = int((py + hy) * 0.5)
+            return px, py
+
+        self.enemies.clear()
         for i in range(count):
-            if not candidates:
-                break
-            x, y = candidates.pop(i % len(candidates))
-            self.enemies.append(Enemy(x, y, radius=16))
+            ex, ey = pick_point()
+            self.enemies.append(Enemy(ex, ey, radius=16))
 
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
         solids = self.tilemap.get_solid_rects_near(self.player.rect)
 
+        # ---------------- Player ----------------
         self.player.update(
             dt,
             input_state,
@@ -74,13 +113,13 @@ class Level:
             solids=solids
         )
 
-        # shoot -> spawn bullet
+        # shoot
         if shoot_pressed:
             b = self.player.try_shoot()
             if b is not None:
                 self.bullets.append(b)
 
-        # clamp player in world
+        # clamp player horizontally
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
@@ -88,13 +127,26 @@ class Level:
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
-        # spikes = damage (30/hit)
+        # spikes damage
         for spike in self.tilemap.spikes:
             if self.player.rect.colliderect(spike):
                 self.player.take_damage(30)
                 break
 
-        # update bullets
+        # ---------------- Waves ----------------
+        if not self.wave_active:
+            self.wave_timer -= dt
+            if self.wave_timer <= 0.0:
+                self._start_next_wave()
+        else:
+            # if all enemies dead -> end wave + delay
+            living = [e for e in self.enemies if not e.dead]
+            if len(living) == 0:
+                self.wave_active = False
+                self.wave_timer = self.wave_cooldown
+                self.enemies.clear()
+
+        # ---------------- Bullets ----------------
         for b in self.bullets:
             b.update(dt, solids)
 
@@ -111,19 +163,20 @@ class Level:
                     b.alive = False
                     break
 
-        # update enemies
+        # ---------------- Enemies ----------------
+        # pass the full enemy list so each enemy can separate & climb over others
         for e in self.enemies:
-            e.update(dt, self.player.rect, solids)
+            e.update(dt, self.player.rect, solids, self.enemies)
 
         # cleanup
         self.bullets = [b for b in self.bullets if b.alive]
         self.enemies = [e for e in self.enemies if not e.dead]
 
-        # death => respawn + heal
+        # death -> respawn
         if self.player.health <= 0:
             self._respawn(full_heal=True)
 
-        # fall => respawn (no heal)
+        # fall -> respawn (no heal)
         if self.player.rect.top > self.fall_y:
             self._respawn(full_heal=False)
 
@@ -137,11 +190,9 @@ class Level:
     def draw(self, surf, camera):
         self.tilemap.draw(surf, camera)
 
-        # bullets
         for b in self.bullets:
             b.draw(surf, camera)
 
-        # enemies
         for e in self.enemies:
             e.draw(surf, camera)
 
