@@ -97,7 +97,7 @@ class Tilemap:
         surf.blit(self._bg, (0, 0))
 
         # 2) world layers (world space)
-        top_left = camera.apply_rect(pygame.Rect(0, 0, self.width_px, self.height_px)).topleft
+        top_left = camera.apply(pygame.Rect(0, 0, self.width_px, self.height_px)).topleft
 
         surf.blit(self._world_layer, top_left)
         surf.blit(self._decor_layer, top_left, special_flags=pygame.BLEND_RGBA_ADD)
