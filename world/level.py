@@ -21,17 +21,15 @@ class Level:
         self.respawn_point = pygame.Vector2(spawn)
         self.fall_y = self.world_rect.bottom + TILE_SIZE * 6
 
-        # bullets / enemies
         self.enemies = []
         self.bullets = []
 
-        # -------- Waves --------
+        # waves
         self.wave_index = 0
         self.wave_active = False
-        self.wave_cooldown = 1.2   # delay between waves
+        self.wave_cooldown = 1.2
         self.wave_timer = 0.6
 
-        # Precompute enemy spawn candidates from this map
         self.spawn_points = self._build_enemy_spawn_points()
 
     def _compute_world_rect(self) -> pygame.Rect:
@@ -57,12 +55,9 @@ class Level:
                         wy = (y - 1) * TILE_SIZE + TILE_SIZE // 2
                         points.append((wx, wy))
 
-        # keep points away from player spawn
         sx, sy = self.player.rect.centerx, self.player.rect.centery
         min_d2 = (TILE_SIZE * 10) ** 2
         points = [p for p in points if (p[0] - sx) ** 2 + (p[1] - sy) ** 2 > min_d2]
-
-        # prefer "lower" spawns so waves rise at player
         points.sort(key=lambda p: p[1], reverse=True)
         return points
 
@@ -70,39 +65,33 @@ class Level:
         self.wave_index += 1
         self.wave_active = True
 
-        # scale enemy count by wave, with a cap
         base = 6
-        add = min(18, self.wave_index * 2)
-        count = min(28, base + add)
+        add = min(22, self.wave_index * 2)
+        count = min(32, base + add)
 
-        # choose spawn points clustered in a couple areas to feel like "waves"
         rng = random.Random(self.wave_index * 99173)
         points = self.spawn_points[:]
         if not points:
             return
 
-        # pick 2-3 "spawn hubs"
         hubs = [points[rng.randrange(0, min(len(points), 60))] for _ in range(rng.randint(2, 3))]
 
         def pick_point():
             hx, hy = hubs[rng.randrange(len(hubs))]
-            # pick a point near hub by index proximity (since sorted by y)
-            idx = rng.randrange(0, len(points))
-            px, py = points[idx]
-            # nudge toward hub a bit
+            px, py = points[rng.randrange(0, len(points))]
             px = int((px + hx) * 0.5)
             py = int((py + hy) * 0.5)
             return px, py
 
         self.enemies.clear()
-        for i in range(count):
+        for _ in range(count):
             ex, ey = pick_point()
             self.enemies.append(Enemy(ex, ey, radius=16))
 
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
         solids = self.tilemap.get_solid_rects_near(self.player.rect)
 
-        # ---------------- Player ----------------
+        # player
         self.player.update(
             dt,
             input_state,
@@ -119,11 +108,11 @@ class Level:
             if b is not None:
                 self.bullets.append(b)
 
-        # clamp player horizontally
+        # clamp player
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
-        # checkpoint when grounded
+        # checkpoint
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
@@ -133,20 +122,18 @@ class Level:
                 self.player.take_damage(30)
                 break
 
-        # ---------------- Waves ----------------
+        # waves
         if not self.wave_active:
             self.wave_timer -= dt
             if self.wave_timer <= 0.0:
                 self._start_next_wave()
         else:
-            # if all enemies dead -> end wave + delay
-            living = [e for e in self.enemies if not e.dead]
-            if len(living) == 0:
+            if len([e for e in self.enemies if not e.dead]) == 0:
                 self.wave_active = False
                 self.wave_timer = self.wave_cooldown
                 self.enemies.clear()
 
-        # ---------------- Bullets ----------------
+        # bullets
         for b in self.bullets:
             b.update(dt, solids)
 
@@ -163,10 +150,12 @@ class Level:
                     b.alive = False
                     break
 
-        # ---------------- Enemies ----------------
-        # pass the full enemy list so each enemy can separate & climb over others
+        # enemies (PATHFIND uses self.grid)
         for e in self.enemies:
-            e.update(dt, self.player.rect, solids, self.enemies)
+            e.update(dt, self.player.rect, solids, self.grid, self.enemies)
+
+        # SOLID enemy-vs-enemy resolution (prevents blob stacking)
+        self._resolve_enemy_collisions()
 
         # cleanup
         self.bullets = [b for b in self.bullets if b.alive]
@@ -176,9 +165,43 @@ class Level:
         if self.player.health <= 0:
             self._respawn(full_heal=True)
 
-        # fall -> respawn (no heal)
+        # fall -> respawn
         if self.player.rect.top > self.fall_y:
             self._respawn(full_heal=False)
+
+    def _resolve_enemy_collisions(self):
+        # Pairwise circle separation to keep enemies "solid"
+        n = len(self.enemies)
+        for i in range(n):
+            a = self.enemies[i]
+            if a.dead:
+                continue
+            for j in range(i + 1, n):
+                b = self.enemies[j]
+                if b.dead:
+                    continue
+
+                d = b.pos - a.pos
+                dist = d.length()
+                min_dist = a.radius + b.radius
+
+                if dist <= 0.001:
+                    # nudge apart deterministically
+                    d = pygame.Vector2(1, 0)
+                    dist = 1.0
+
+                if dist < min_dist:
+                    overlap = (min_dist - dist)
+                    nrm = d / dist
+
+                    # push each away half the overlap
+                    push = nrm * (overlap * 0.5)
+                    a.pos -= push
+                    b.pos += push
+
+                    # dampen horizontal velocity a bit to avoid jitter
+                    a.vel.x *= 0.95
+                    b.vel.x *= 0.95
 
     def _respawn(self, full_heal: bool):
         self.player.rect.topleft = self.respawn_point
