@@ -1,4 +1,4 @@
-# world/level.py
+# world/level.py  (FULL FILE update: clamp + respawn enemies that leave the world)
 import pygame
 import random
 
@@ -30,7 +30,7 @@ class Level:
         self.wave_cooldown = 1.2
         self.wave_timer = 0.6
 
-        # spawn behavior (drop-in)
+        # drop-in spawning
         self.spawn_y = -TILE_SIZE * 6
         self.drop_points = self._build_drop_points()
 
@@ -46,21 +46,16 @@ class Level:
                     return pygame.Vector2(x * TILE_SIZE + 8, y * TILE_SIZE + 2)
         return pygame.Vector2(TILE_SIZE * 2, TILE_SIZE * 2)
 
-    # ------------------------------------------------------------
-    # NEW: drop-in spawn points (columns that are "open enough")
-    # ------------------------------------------------------------
     def _build_drop_points(self):
         rows = len(self.grid)
         cols = len(self.grid[0]) if rows else 0
         if rows == 0 or cols == 0:
             return []
 
-        # precompute columns where the top N tiles are not solid
-        # so we can spawn above and they will fall into the arena
+        solids = {"#", "C", "M"}
         open_cols = []
-        check_depth = min(12, rows)  # only need to ensure a short "air lane"
+        check_depth = min(12, rows)
 
-        solids = {"#", "C", "M"}  # must match your tile solids
         for x in range(cols):
             blocked = False
             for y in range(check_depth):
@@ -70,19 +65,12 @@ class Level:
             if not blocked:
                 open_cols.append(x)
 
-        # convert to world X positions centered on tile
         points = [x * TILE_SIZE + TILE_SIZE // 2 for x in open_cols]
 
-        # keep drops away from player spawn area a bit (reduce insta-pile on player)
         px = self.player.rect.centerx
         min_dx = TILE_SIZE * 6
-        points = [wx for wx in points if abs(wx - px) > min_dx]
-
-        # fallback: if filtering removed too many, keep all
-        if len(points) < 6:
-            points = [x * TILE_SIZE + TILE_SIZE // 2 for x in open_cols]
-
-        return points
+        filtered = [wx for wx in points if abs(wx - px) > min_dx]
+        return filtered if len(filtered) >= 6 else points
 
     def _start_next_wave(self):
         self.wave_index += 1
@@ -93,17 +81,13 @@ class Level:
         count = min(34, base + add)
 
         rng = random.Random(self.wave_index * 99173)
-
-        # if no drop points, just don't spawn
         if not self.drop_points:
             return
 
-        # choose 2-3 drop hubs so waves "pour in" from areas
         hubs = [self.drop_points[rng.randrange(len(self.drop_points))] for _ in range(rng.randint(2, 3))]
 
         def pick_drop_x():
             hx = hubs[rng.randrange(len(hubs))]
-            # pick a nearby x from the list (by nearest index)
             idx = min(range(len(self.drop_points)), key=lambda i: abs(self.drop_points[i] - hx))
             spread = rng.randint(2, 6)
             j = clamp_int(idx + rng.randint(-spread, spread), 0, len(self.drop_points) - 1)
@@ -112,18 +96,14 @@ class Level:
         self.enemies.clear()
 
         for i in range(count):
-            ex = pick_drop_x()
-
-            # slight horizontal jitter so they don't spawn perfectly stacked
-            ex += rng.randint(-10, 10)
-
-            ey = self.spawn_y - i * 10  # stagger vertically so they don't overlap instantly
+            ex = pick_drop_x() + rng.randint(-10, 10)
+            ey = self.spawn_y - i * 10
             self.enemies.append(Enemy(ex, ey, radius=16))
 
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
         solids = self.tilemap.get_solid_rects_near(self.player.rect)
 
-        # player
+        # ---------------- Player ----------------
         self.player.update(
             dt,
             input_state,
@@ -134,27 +114,24 @@ class Level:
             solids=solids
         )
 
-        # shoot
         if shoot_pressed:
             b = self.player.try_shoot()
             if b is not None:
                 self.bullets.append(b)
 
-        # clamp player
+        # clamp player to world
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
-        # checkpoint
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
-        # spikes damage
         for spike in self.tilemap.spikes:
             if self.player.rect.colliderect(spike):
                 self.player.take_damage(30)
                 break
 
-        # waves
+        # ---------------- Waves ----------------
         if not self.wave_active:
             self.wave_timer -= dt
             if self.wave_timer <= 0.0:
@@ -165,11 +142,10 @@ class Level:
                 self.wave_timer = self.wave_cooldown
                 self.enemies.clear()
 
-        # bullets
+        # ---------------- Bullets ----------------
         for b in self.bullets:
             b.update(dt, solids)
 
-        # bullet vs enemy
         for b in self.bullets:
             if not b.alive:
                 continue
@@ -182,24 +158,42 @@ class Level:
                     b.alive = False
                     break
 
-        # enemies (PATHFIND uses self.grid)
+        # ---------------- Enemies ----------------
         for e in self.enemies:
             e.update(dt, self.player.rect, solids, self.grid, self.enemies)
 
-        # SOLID enemy-vs-enemy resolution
+            # HARD CLAMP X so dashes cannot push them outside the world
+            if e.pos.x < self.world_rect.left + e.radius:
+                e.pos.x = self.world_rect.left + e.radius
+                e.vel.x = 0.0
+                # cancel dash if it was driving them out
+                if getattr(e, "dashing", False):
+                    e.dashing = False
+                    e.dash_timer = 0.0
+
+            if e.pos.x > self.world_rect.right - e.radius:
+                e.pos.x = self.world_rect.right - e.radius
+                e.vel.x = 0.0
+                if getattr(e, "dashing", False):
+                    e.dashing = False
+                    e.dash_timer = 0.0
+
+        # solid enemy-vs-enemy
         self._resolve_enemy_collisions()
+
+        # respawn enemies that fall out of the arena
+        self._respawn_fallen_enemies()
 
         # cleanup
         self.bullets = [b for b in self.bullets if b.alive]
         self.enemies = [e for e in self.enemies if not e.dead]
 
-        # death -> respawn
+        # player respawns
         if self.player.health <= 0:
-            self._respawn(full_heal=True)
+            self._respawn_player(full_heal=True)
 
-        # fall -> respawn
         if self.player.rect.top > self.fall_y:
-            self._respawn(full_heal=False)
+            self._respawn_player(full_heal=False)
 
     def _resolve_enemy_collisions(self):
         n = len(self.enemies)
@@ -229,7 +223,39 @@ class Level:
                     a.vel.x *= 0.95
                     b.vel.x *= 0.95
 
-    def _respawn(self, full_heal: bool):
+    def _respawn_fallen_enemies(self):
+        if not self.drop_points:
+            return
+
+        rng = random.Random(self.wave_index * 2467 + 1337)
+
+        for e in self.enemies:
+            if e.dead:
+                continue
+
+            # if they fell below the world, respawn above
+            if e.rect.top > self.fall_y:
+                ex = self.drop_points[rng.randrange(len(self.drop_points))] + rng.randint(-10, 10)
+                e.pos.update(ex, self.spawn_y)
+                e.vel.update(0, 0)
+
+                # reset enemy "player-like" movement states if present
+                if hasattr(e, "dashing"):
+                    e.dashing = False
+                if hasattr(e, "dash_timer"):
+                    e.dash_timer = 0.0
+                if hasattr(e, "dash_cd"):
+                    e.dash_cd = 0.15
+                if hasattr(e, "air_dashes_left") and hasattr(e, "air_dashes_max"):
+                    e.air_dashes_left = e.air_dashes_max
+                if hasattr(e, "jumps_left") and hasattr(e, "max_jumps"):
+                    e.jumps_left = e.max_jumps
+                if hasattr(e, "path"):
+                    e.path = []
+                    e.path_index = 0
+                    e.repath_timer = 0.0
+
+    def _respawn_player(self, full_heal: bool):
         self.player.rect.topleft = self.respawn_point
         self.player.vel.xy = (0, 0)
         if full_heal:
