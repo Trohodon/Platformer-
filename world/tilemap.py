@@ -8,29 +8,40 @@ SOLID_CHARS = {"#", "C", "M"}
 
 class Tilemap:
     """
-    Visual upgrade tilemap:
+    Visual upgrade tilemap (no external assets):
+    - Handles NON-rectangular ASCII maps safely (pads rows)
     - Greedy-merged solid rectangles for faster collision + cleaner draw
-    - Pretty tiles: subtle gradients, outlines, cracks, top highlights
-    - Spikes drawn as triangles (not boxes)
-    - C and M get distinct "material" looks
-    - Optional parallax background grid + vignette (no assets)
+    - Pretty tiles: subtle highlights, outlines, texture
+    - Spikes drawn as triangles (collision uses rects)
+    - Cached full-map surfaces for fast drawing
     """
 
     def __init__(self, grid):
-        self.grid = grid
-        self.rows = len(grid)
-        self.cols = len(grid[0]) if self.rows else 0
+        # Normalize row lengths so we never crash on ragged maps
+        self.grid = self._normalize_grid(grid)
+        self.rows = len(self.grid)
+        self.cols = len(self.grid[0]) if self.rows else 0
 
         self.solids = []          # merged collision rects
         self.spikes = []          # spike rects for collision
         self.spike_tiles = []     # spike tile coords for draw
 
         # render caches
+        self._bg_surface = None
         self._solid_surface = None
         self._spike_surface = None
-        self._bg_surface = None
 
         self._build()
+
+    # ------------------------------------------------------------
+    # Grid normalization (fixes your crash)
+    # ------------------------------------------------------------
+    def _normalize_grid(self, grid):
+        if not grid:
+            return []
+        max_cols = max(len(r) for r in grid)
+        # pad missing cells with walls so the world stays bounded
+        return [r.ljust(max_cols, "#") for r in grid]
 
     # ------------------------------------------------------------
     # Build: merge solids + collect spikes + pre-render
@@ -43,6 +54,7 @@ class Tilemap:
         if self.rows == 0 or self.cols == 0:
             return
 
+        # rectangular boolean map for merging
         solid_grid = [[False] * self.cols for _ in range(self.rows)]
 
         for y, row in enumerate(self.grid):
@@ -61,7 +73,6 @@ class Tilemap:
                     self.spike_tiles.append((x, y))
 
         self.solids = self._greedy_merge_solids(solid_grid)
-
         self._pre_render()
 
     def _greedy_merge_solids(self, solid_grid):
@@ -75,12 +86,12 @@ class Tilemap:
                     x += 1
                     continue
 
-                # find max width
+                # max width
                 w = 1
                 while x + w < self.cols and solid_grid[y][x + w] and not visited[y][x + w]:
                     w += 1
 
-                # find max height for that width
+                # max height for that width
                 h = 1
                 done = False
                 while y + h < self.rows and not done:
@@ -96,18 +107,19 @@ class Tilemap:
                     for xx in range(x, x + w):
                         visited[yy][xx] = True
 
-                merged.append(pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, w * TILE_SIZE, h * TILE_SIZE))
+                merged.append(
+                    pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, w * TILE_SIZE, h * TILE_SIZE)
+                )
                 x += w
 
         return merged
 
     # ------------------------------------------------------------
-    # Rendering
+    # Rendering (cached)
     # ------------------------------------------------------------
     def _pre_render(self):
         w = self.cols * TILE_SIZE
         h = self.rows * TILE_SIZE
-
         if w <= 0 or h <= 0:
             return
 
@@ -120,36 +132,34 @@ class Tilemap:
         self._draw_spikes(self._spike_surface)
 
     def _draw_background(self, surf):
-        # soft dark base
+        # dark base
         surf.fill((14, 16, 24, 255))
 
-        # faint parallax grid pattern (baked at full res; camera provides motion)
+        # faint grid
         step = TILE_SIZE * 2
         for x in range(0, surf.get_width(), step):
             pygame.draw.line(surf, (22, 25, 38, 255), (x, 0), (x, surf.get_height()), 1)
         for y in range(0, surf.get_height(), step):
             pygame.draw.line(surf, (22, 25, 38, 255), (0, y), (surf.get_width(), y), 1)
 
-        # vignette
-        v = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
-        w, h = surf.get_size()
-        pygame.draw.rect(v, (0, 0, 0, 0), (0, 0, w, h))
-        pygame.draw.rect(v, (0, 0, 0, 85), (0, 0, w, h), border_radius=18)
-        surf.blit(v, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
+        # vignette-ish edge darkening
+        overlay = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 0))
+        pygame.draw.rect(overlay, (0, 0, 0, 70), overlay.get_rect(), border_radius=18)
+        surf.blit(overlay, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
 
     def _tile_material_color(self, ch):
-        if ch == "#":
+        if ch == "#":   # stone
             return (70, 78, 95)
-        if ch == "C":  # "castle/brick"
+        if ch == "C":   # brick/castle
             return (92, 78, 74)
-        if ch == "M":  # "metal"
+        if ch == "M":   # metal
             return (76, 84, 92)
         return (70, 78, 95)
 
     def _draw_solids(self, surf):
         rng = random.Random(1337)
 
-        # draw per-tile details so it looks like tiles, but keep collisions merged
         for y, row in enumerate(self.grid):
             for x, ch in enumerate(row):
                 if ch not in SOLID_CHARS:
@@ -158,10 +168,10 @@ class Tilemap:
                 base = self._tile_material_color(ch)
                 r = pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
 
-                # base fill
+                # base tile
                 pygame.draw.rect(surf, base, r)
 
-                # subtle gradient highlight (top)
+                # top highlight
                 hl = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
                 pygame.draw.rect(hl, (255, 255, 255, 18), (0, 0, TILE_SIZE, max(2, TILE_SIZE // 4)))
                 surf.blit(hl, r.topleft)
@@ -169,7 +179,7 @@ class Tilemap:
                 # outline
                 pygame.draw.rect(surf, (28, 32, 44), r, 1)
 
-                # cracks / texture
+                # texture by type
                 if ch == "#":
                     if rng.random() < 0.22:
                         self._draw_crack(surf, r, rng, (45, 50, 64))
@@ -180,33 +190,35 @@ class Tilemap:
                     if x % 3 == 0:
                         pygame.draw.line(surf, (58, 50, 46), (r.centerx, r.y), (r.centerx, r.bottom), 1)
                 elif ch == "M":
-                    # rivets
                     if rng.random() < 0.20:
                         self._draw_rivet(surf, r, rng)
 
-                # top edge glow if exposed to air above (makes platforms pop)
+                # exposed top edge glow (platform pop)
                 if y > 0 and self.grid[y - 1][x] not in SOLID_CHARS:
-                    pygame.draw.line(surf, (210, 220, 255), (r.x + 1, r.y + 1), (r.right - 2, r.y + 1), 1)
+                    pygame.draw.line(
+                        surf, (210, 220, 255),
+                        (r.x + 1, r.y + 1), (r.right - 2, r.y + 1), 1
+                    )
 
-        # optional: draw merged blocks faint shadow for depth
+        # subtle depth shadows per merged block
         for block in self.solids:
             shadow = pygame.Surface((block.w, block.h), pygame.SRCALPHA)
-            pygame.draw.rect(shadow, (0, 0, 0, 40), (0, 0, block.w, block.h))
+            pygame.draw.rect(shadow, (0, 0, 0, 38), (0, 0, block.w, block.h))
             surf.blit(shadow, (block.x + 2, block.y + 2))
 
     def _draw_crack(self, surf, r, rng, color):
-        points = []
+        pts = []
         x = r.x + rng.randint(2, TILE_SIZE - 3)
         y = r.y + rng.randint(2, TILE_SIZE - 3)
-        points.append((x, y))
+        pts.append((x, y))
         for _ in range(rng.randint(2, 5)):
             x += rng.randint(-8, 8)
             y += rng.randint(-8, 8)
             x = max(r.x + 2, min(r.right - 3, x))
             y = max(r.y + 2, min(r.bottom - 3, y))
-            points.append((x, y))
-        if len(points) >= 2:
-            pygame.draw.lines(surf, color, False, points, 1)
+            pts.append((x, y))
+        if len(pts) >= 2:
+            pygame.draw.lines(surf, color, False, pts, 1)
 
     def _draw_rivet(self, surf, r, rng):
         cx = r.x + rng.randint(6, TILE_SIZE - 7)
@@ -216,14 +228,12 @@ class Tilemap:
         pygame.draw.circle(surf, (255, 255, 255), (cx - 1, cy - 1), 1)
 
     def _draw_spikes(self, surf):
-        # draw triangle spikes for each spike tile
         for (x, y) in self.spike_tiles:
             r = pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
 
-            # three spikes per tile
             spikes = 3
             pad = 3
-            w = (TILE_SIZE - pad * 2) // spikes
+            w = max(4, (TILE_SIZE - pad * 2) // spikes)
             base_y = r.bottom - 3
 
             for i in range(spikes):
@@ -236,9 +246,8 @@ class Tilemap:
                 pygame.draw.polygon(surf, (210, 70, 70), pts)
                 pygame.draw.polygon(surf, (90, 25, 25), pts, 1)
 
-            # slight glow
             glow = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
-            pygame.draw.rect(glow, (255, 80, 80, 18), (0, TILE_SIZE // 2, TILE_SIZE, TILE_SIZE // 2))
+            pygame.draw.rect(glow, (255, 80, 80, 16), (0, TILE_SIZE // 2, TILE_SIZE, TILE_SIZE // 2))
             surf.blit(glow, r.topleft)
 
     # ------------------------------------------------------------
@@ -246,14 +255,16 @@ class Tilemap:
     # ------------------------------------------------------------
     def draw(self, surf: pygame.Surface, camera):
         if self._bg_surface is not None:
-            surf.blit(self._bg_surface, camera.apply(pygame.Rect(0, 0, self._bg_surface.get_width(), self._bg_surface.get_height())))
+            r = pygame.Rect(0, 0, self._bg_surface.get_width(), self._bg_surface.get_height())
+            surf.blit(self._bg_surface, camera.apply(r))
 
         if self._solid_surface is not None:
-            surf.blit(self._solid_surface, camera.apply(pygame.Rect(0, 0, self._solid_surface.get_width(), self._solid_surface.get_height())))
+            r = pygame.Rect(0, 0, self._solid_surface.get_width(), self._solid_surface.get_height())
+            surf.blit(self._solid_surface, camera.apply(r))
 
         if self._spike_surface is not None:
-            surf.blit(self._spike_surface, camera.apply(pygame.Rect(0, 0, self._spike_surface.get_width(), self._spike_surface.get_height())))
+            r = pygame.Rect(0, 0, self._spike_surface.get_width(), self._spike_surface.get_height())
+            surf.blit(self._spike_surface, camera.apply(r))
 
     def get_solid_rects_near(self, rect: pygame.Rect):
-        # keep it simple for now; merged list is already much smaller than per-tile
         return self.solids
