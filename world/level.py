@@ -1,4 +1,4 @@
-# world/level.py  (FULL FILE update using WaveManager + wave definitions)
+# world/level.py  (FULL FILE update: enemies take spike damage + AI avoids spikes)
 import pygame
 import random
 
@@ -10,6 +10,9 @@ from entities.enemy import Enemy
 
 from world.waves import WaveManager
 from world.wave_defs import WAVES
+
+
+SPIKE_DAMAGE = 30
 
 
 class Level:
@@ -34,7 +37,7 @@ class Level:
         # dedicated wave system
         self.waves = WaveManager(WAVES, cooldown=1.2)
 
-        # deterministic per-run RNG for spawn picking
+        # deterministic per-wave RNG
         self._spawn_rng = random.Random(12345)
 
     def _compute_world_rect(self) -> pygame.Rect:
@@ -83,12 +86,11 @@ class Level:
         if wave_def is None:
             return
 
-        # seed RNG from wave number so wave spawns feel stable
         self._spawn_rng = random.Random(self.waves.wave_number * 99991 + 1337)
 
-        # choose 2-3 hubs so enemies pour in from "areas"
         if not self.drop_points:
             return
+
         hubs = [self.drop_points[self._spawn_rng.randrange(len(self.drop_points))] for _ in range(self._spawn_rng.randint(2, 3))]
 
         def pick_drop_x():
@@ -98,7 +100,6 @@ class Level:
             j = clamp_int(idx + self._spawn_rng.randint(-spread, spread), 0, len(self.drop_points) - 1)
             return self.drop_points[j]
 
-        # spawn entries
         spawn_list = []
         for entry in wave_def.get("entries", []):
             etype = entry.get("type", "basic")
@@ -106,23 +107,16 @@ class Level:
             for _ in range(count):
                 spawn_list.append(etype)
 
-        # stagger y so they don't overlap instantly
         for i, etype in enumerate(spawn_list):
             ex = pick_drop_x() + self._spawn_rng.randint(-10, 10)
             ey = self.spawn_y - i * 10
-
-            enemy = self._create_enemy(etype, ex, ey)
-            self.enemies.append(enemy)
+            self.enemies.append(self._create_enemy(etype, ex, ey))
 
         self.waves.mark_wave_started()
 
     def _create_enemy(self, etype: str, x: float, y: float):
-        # Future-proof: add new enemy classes here later.
-        # For now, everything maps to Enemy (basic).
         if etype == "basic":
             return Enemy(x, y, radius=16)
-
-        # fallback
         return Enemy(x, y, radius=16)
 
     # ------------------------------------------------------------
@@ -131,7 +125,7 @@ class Level:
     def update(self, dt, input_state, jump_pressed, jump_released, jump_held, dash_pressed, shoot_pressed):
         solids = self.tilemap.get_solid_rects_near(self.player.rect)
 
-        # player
+        # ---------------- Player ----------------
         self.player.update(
             dt,
             input_state,
@@ -147,31 +141,29 @@ class Level:
             if b is not None:
                 self.bullets.append(b)
 
-        # clamp player
         self.player.rect.left = max(self.world_rect.left, self.player.rect.left)
         self.player.rect.right = min(self.world_rect.right, self.player.rect.right)
 
         if self.player.on_ground:
             self.respawn_point.update(self.player.rect.topleft)
 
-        # spikes damage
+        # Player spike damage
         for spike in self.tilemap.spikes:
             if self.player.rect.colliderect(spike):
-                self.player.take_damage(30)
+                self.player.take_damage(SPIKE_DAMAGE)
                 break
 
-        # ---- wave manager ----
+        # ---------------- Waves ----------------
         alive_enemies = len([e for e in self.enemies if not e.dead])
         start_new = self.waves.update(dt, alive_enemies)
         if start_new:
             self.enemies.clear()
             self._spawn_wave()
 
-        # bullets
+        # ---------------- Bullets ----------------
         for b in self.bullets:
             b.update(dt, solids)
 
-        # bullet vs enemy
         for b in self.bullets:
             if not b.alive:
                 continue
@@ -184,9 +176,18 @@ class Level:
                     b.alive = False
                     break
 
-        # enemies
+        # ---------------- Enemies ----------------
         for e in self.enemies:
+            # Tell enemy if a spike is directly ahead so it can jump/dash over it
+            e.avoid_spikes = self._spike_ahead_for_enemy(e)
+
             e.update(dt, self.player.rect, solids, self.grid, self.enemies)
+
+            # Enemy spike damage
+            for spike in self.tilemap.spikes:
+                if e.rect.colliderect(spike):
+                    e.take_damage(SPIKE_DAMAGE)
+                    break
 
             # clamp x so dash can't push them out
             if e.pos.x < self.world_rect.left + e.radius:
@@ -202,23 +203,50 @@ class Level:
                     e.dashing = False
                     e.dash_timer = 0.0
 
-        # solid enemy-vs-enemy
         self._resolve_enemy_collisions()
-
-        # respawn fallen enemies (keep wave intact)
         self._respawn_fallen_enemies()
 
-        # cleanup
         self.bullets = [b for b in self.bullets if b.alive]
         self.enemies = [e for e in self.enemies if not e.dead]
 
         # player respawns
         if self.player.health <= 0:
             self._respawn_player(full_heal=True)
-
         if self.player.rect.top > self.fall_y:
             self._respawn_player(full_heal=False)
 
+    # ------------------------------------------------------------
+    # Spike probe for enemy AI
+    # ------------------------------------------------------------
+    def _spike_ahead_for_enemy(self, e) -> bool:
+        """
+        Returns True if there's a spike tile directly in front of the enemy
+        at foot-level (so AI should attempt to jump/dash over it).
+        """
+        if not hasattr(e, "facing"):
+            return False
+
+        rows = len(self.grid)
+        cols = len(self.grid[0]) if rows else 0
+        if rows == 0 or cols == 0:
+            return False
+
+        # check 1 tile ahead where their feet will land
+        ahead_x = e.pos.x + (e.facing * e.radius * 1.6)
+        foot_y = e.pos.y + e.radius + 2
+
+        cx = int(ahead_x // TILE_SIZE)
+        cy = int((foot_y - TILE_SIZE * 0.5) // TILE_SIZE)  # slightly above foot
+
+        if not (0 <= cx < cols and 0 <= cy < rows):
+            return False
+
+        # spike tile sits at air position with solid below in your map format
+        return self.grid[cy][cx] == "^"
+
+    # ------------------------------------------------------------
+    # Collisions / Respawns
+    # ------------------------------------------------------------
     def _resolve_enemy_collisions(self):
         n = len(self.enemies)
         for i in range(n):
