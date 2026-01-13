@@ -12,15 +12,13 @@ SOLIDS = {"#", "C", "M"}  # must match your Tilemap solid set
 
 class Enemy:
     """
-    Enemy with (almost) the same movement kit as Player:
-    - Double jump (2 jumps)
-    - Dash (ground + air dashes limited)
+    Enemy with a player-like kit:
+    - Double jump
+    - Dash (limited air dash)
     - Wall slide + wall jump
-    - Pathfinding (BFS on tile grid) to navigate maze-like levels
-    - Solid vs solid tiles via rect collision
-    - Solid vs other enemies handled in Level via circle separation
-
-    AI uses the path to set desired direction and decides when to jump/dash/walljump.
+    - BFS pathfinding on the grid
+    - Spike avoidance: detects spikes ahead and jumps/dashes over them
+    NOTE: spike damage is applied in Level (same as player).
     """
 
     def __init__(self, x: float, y: float, radius: int = 16):
@@ -33,7 +31,7 @@ class Enemy:
         self.health = 60
         self.dead = False
 
-        # movement tuning (enemy feels a bit "heavier" than player by default)
+        # movement tuning
         self.speed = 205.0
         self.jump_speed = 760.0
 
@@ -76,9 +74,6 @@ class Enemy:
         self.path_index = 0
         self._last_player_cell: Optional[Tuple[int, int]] = None
 
-    # ------------------------------------------------------------
-    # Geometry
-    # ------------------------------------------------------------
     @property
     def rect(self) -> pygame.Rect:
         return pygame.Rect(
@@ -111,23 +106,30 @@ class Enemy:
         # path
         self._pathfind_update(dt, player_rect, grid)
 
-        # desired horizontal direction from path (fallback = chase)
+        # desired direction
         move_dir = self._desired_move_dir(player_rect)
         if move_dir != 0.0:
             self.facing = 1 if move_dir > 0 else -1
             self._dash_dir = self.facing
 
-        # dash decision: if blocked by enemy in front OR need to cross a gap quickly
+        # environment probes
         blocked_by_enemy = self._blocked_by_enemy(move_dir, neighbors)
+        blocked_by_spike = self._spike_ahead(move_dir, grid)  # << key change
         gap_ahead = self._gap_ahead(move_dir, grid)
-        should_dash = (blocked_by_enemy or (gap_ahead and abs(player_rect.centerx - self.pos.x) > TILE_SIZE * 2))
 
-        if (not self.dashing) and should_dash and self.dash_cd <= 0.0:
+        # dash decision
+        should_dash = (
+            (blocked_by_enemy and self.on_ground) or
+            (blocked_by_spike and self.on_ground) or
+            (gap_ahead and abs(player_rect.centerx - self.pos.x) > TILE_SIZE * 2)
+        )
+
+        if (not self.dashing) and should_dash and self.dash_cd <= 0.0 and move_dir != 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
-            if can_dash and move_dir != 0.0:
+            if can_dash:
                 self._start_dash(move_dir)
 
-        # movement
+        # horizontal movement
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0.0:
@@ -135,22 +137,21 @@ class Enemy:
         else:
             self.vel.x = move_dir * self.speed
 
-        # gravity always applies (dash clears vy only at start)
+        # gravity
         self.vel.y += GRAVITY * dt
         self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
 
-        # apply movement + world collisions
+        # move/collide
         pre_vx = self.vel.x
         self._move_x(dt, solids)
         self._move_y(dt, solids)
 
-        # wall flags (after movement)
+        # wall flags
         self._update_wall_flags(solids)
 
         # coyote / resets
         if self.on_ground:
             self.coyote_timer = self.coyote_time
-
         if self.on_ground and not self.was_on_ground:
             self.jumps_left = self.max_jumps
             self.air_dashes_left = self.air_dashes_max
@@ -163,25 +164,26 @@ class Enemy:
             if (self.on_wall_left and move_dir < 0) or (self.on_wall_right and move_dir > 0):
                 self.vel.y = min(self.vel.y, self.wall_slide_speed)
 
-        # jump decisions (AI)
+        # jump decisions
         blocked_by_wall = (abs(pre_vx) > 1.0 and abs(self.vel.x) < 1e-3)
         player_above = player_rect.centery < (self.pos.y - self.radius - TILE_SIZE * 0.25)
         close_x = abs(player_rect.centerx - self.pos.x) < (TILE_SIZE * 4)
 
-        # jump if:
-        # - blocked by a wall, or
-        # - player is above and close, or
-        # - there's a gap ahead (try to clear), or
-        # - blocked by enemy and dash wasn't available
-        want_jump = blocked_by_wall or (player_above and close_x) or gap_ahead or (blocked_by_enemy and (not self.dashing))
+        # spike ahead should cause an early jump even if not blocked yet
+        want_jump = (
+            blocked_by_wall or
+            blocked_by_spike or
+            gap_ahead or
+            (player_above and close_x) or
+            (blocked_by_enemy and (not self.dashing))
+        )
 
         if want_jump and self.jump_cd <= 0.0:
-            # wall jump if touching wall and in air
+            # wall jump if touching wall
             if (not self.on_ground) and (self.on_wall_left or self.on_wall_right) and self.wall_stick_timer > 0.0:
                 self._do_wall_jump()
                 self.jump_cd = 0.18
             else:
-                # normal/double jump
                 if (self.on_ground or self.coyote_timer > 0.0) and self.jumps_left > 0:
                     self._do_jump()
                     self.jump_cd = 0.16
@@ -193,7 +195,7 @@ class Enemy:
         self.was_on_ground = self.on_ground
 
     # ------------------------------------------------------------
-    # Dash / Jump actions
+    # Actions
     # ------------------------------------------------------------
     def _start_dash(self, move_dir: float):
         self.dashing = True
@@ -326,10 +328,8 @@ class Enemy:
             cur = came_from.get(cur, None)
 
         path_rev.reverse()
-
         if path_rev and path_rev[0] == (sx, sy):
             path_rev = path_rev[1:]
-
         return path_rev
 
     def _nearest_walkable(self, grid: List[str], cx: int, cy: int, radius: int = 3) -> Optional[Tuple[int, int]]:
@@ -348,8 +348,7 @@ class Enemy:
         return best
 
     def _is_walkable(self, grid: List[str], x: int, y: int) -> bool:
-        ch = grid[y][x]
-        return ch not in SOLIDS
+        return grid[y][x] not in SOLIDS
 
     def _world_to_cell(self, wx: float, wy: float) -> Tuple[int, int]:
         return int(wx // TILE_SIZE), int(wy // TILE_SIZE)
@@ -358,8 +357,40 @@ class Enemy:
         return pygame.Vector2(cx * TILE_SIZE + TILE_SIZE * 0.5, cy * TILE_SIZE + TILE_SIZE * 0.5)
 
     # ------------------------------------------------------------
-    # AI helpers: gap & enemy probe
+    # Probes: spike / gap / enemy
     # ------------------------------------------------------------
+    def _spike_ahead(self, move_dir: float, grid: List[str]) -> bool:
+        """
+        Checks 1–2 tiles ahead for a spike '^' sitting on top of solid.
+        We check at "feet landing" height, not current head height.
+        """
+        if move_dir == 0.0:
+            return False
+
+        rows = len(grid)
+        cols = len(grid[0]) if rows else 0
+        if rows == 0 or cols == 0:
+            return False
+
+        # Look ahead by ~1 tile in the movement direction
+        look_dist = max(TILE_SIZE * 0.9, self.radius * 2.2)
+        foot_x = self.pos.x + (move_dir * look_dist)
+        foot_y = self.pos.y + self.radius + 2
+
+        cx = int(foot_x // TILE_SIZE)
+        cy = int((foot_y - 1) // TILE_SIZE)
+
+        # Also check the next tile beyond that (helps at higher speeds)
+        cx2 = int((foot_x + move_dir * (TILE_SIZE * 0.75)) // TILE_SIZE)
+
+        for tx in (cx, cx2):
+            if not (0 <= tx < cols and 0 <= cy < rows):
+                continue
+            if grid[cy][tx] == "^":
+                return True
+
+        return False
+
     def _gap_ahead(self, move_dir: float, grid: List[str]) -> bool:
         if move_dir == 0.0:
             return False
@@ -369,18 +400,19 @@ class Enemy:
         if rows == 0 or cols == 0:
             return False
 
-        # look one tile ahead at foot position; if below is NOT solid, it's a gap
         foot_x = self.pos.x + (move_dir * self.radius * 1.2)
         foot_y = self.pos.y + self.radius + 2
 
         cx = int(foot_x // TILE_SIZE)
         cy = int(foot_y // TILE_SIZE)
-        below_y = cy
 
-        if not (0 <= cx < cols and 0 <= below_y < rows):
+        if not (0 <= cx < cols and 0 <= cy < rows):
             return True
 
-        ch = grid[below_y][cx]
+        # if the tile at foot_y is solid, we're already intersecting ground; treat as not-gap
+        # the "gap" we care about is whether there will be ground below the landing tile
+        ground_y = cy
+        ch = grid[ground_y][cx]
         return ch not in SOLIDS
 
     def _blocked_by_enemy(self, move_dir: float, neighbors) -> bool:
