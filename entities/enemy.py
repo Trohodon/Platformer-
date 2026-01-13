@@ -7,17 +7,20 @@ from core.settings import GRAVITY, MAX_FALL_SPEED, TILE_SIZE
 from core.utils import clamp
 
 
-WALKABLE = {".", "P", "^"}   # enemies can walk through spike tiles (damage handled elsewhere)
-SOLIDS = {"#", "C", "M"}     # same as tilemap solids
+SOLIDS = {"#", "C", "M"}  # must match your Tilemap solid set
 
 
 class Enemy:
     """
-    Solid circle enemy with:
-    - Tile-based BFS pathfinding through maze-like levels (replans periodically)
-    - Dash-to-climb behavior when blocked by other enemies
-    - Standard rect-vs-tile collision
-    Enemy solidity vs enemy is resolved in Level (pairwise circle separation).
+    Enemy with (almost) the same movement kit as Player:
+    - Double jump (2 jumps)
+    - Dash (ground + air dashes limited)
+    - Wall slide + wall jump
+    - Pathfinding (BFS on tile grid) to navigate maze-like levels
+    - Solid vs solid tiles via rect collision
+    - Solid vs other enemies handled in Level via circle separation
+
+    AI uses the path to set desired direction and decides when to jump/dash/walljump.
     """
 
     def __init__(self, x: float, y: float, radius: int = 16):
@@ -25,24 +28,46 @@ class Enemy:
         self.vel = pygame.Vector2(0, 0)
         self.radius = radius
 
+        # health
         self.max_health = 60
         self.health = 60
         self.dead = False
 
-        self.speed = 210.0
+        # movement tuning (enemy feels a bit "heavier" than player by default)
+        self.speed = 205.0
         self.jump_speed = 760.0
 
-        # dash to "climb" over crowds
+        # jump kit
+        self.max_jumps = 2
+        self.jumps_left = self.max_jumps
+        self.coyote_time = 0.10
+        self.coyote_timer = 0.0
+        self.jump_cd = 0.0
+
+        # wall kit
+        self.on_wall_left = False
+        self.on_wall_right = False
+        self.wall_slide_speed = 420.0
+        self.wall_jump_x = 420.0
+        self.wall_jump_y = 760.0
+        self.wall_stick_time = 0.10
+        self.wall_stick_timer = 0.0
+
+        # dash kit
         self.dashing = False
         self.dash_timer = 0.0
-        self.dash_cd = 0.0
         self.dash_time = 0.14
         self.dash_speed = 520.0
-        self.dash_hop = 260.0
         self.dash_cooldown = 0.55
+        self.dash_cd = 0.0
+        self.air_dashes_max = 1
+        self.air_dashes_left = self.air_dashes_max
+        self._dash_dir = 1
 
+        # state
         self.on_ground = False
-        self.jump_cd = 0.0
+        self.was_on_ground = False
+        self.facing = 1
 
         # pathfinding
         self.repath_timer = 0.0
@@ -51,6 +76,9 @@ class Enemy:
         self.path_index = 0
         self._last_player_cell: Optional[Tuple[int, int]] = None
 
+    # ------------------------------------------------------------
+    # Geometry
+    # ------------------------------------------------------------
     @property
     def rect(self) -> pygame.Rect:
         return pygame.Rect(
@@ -74,27 +102,32 @@ class Enemy:
         if self.dead:
             return
 
+        # timers
         self.jump_cd = max(0.0, self.jump_cd - dt)
+        self.coyote_timer = max(0.0, self.coyote_timer - dt)
+        self.wall_stick_timer = max(0.0, self.wall_stick_timer - dt)
         self.dash_cd = max(0.0, self.dash_cd - dt)
 
-        # --- pathfind ---
+        # path
         self._pathfind_update(dt, player_rect, grid)
 
-        # choose target direction from path (fallback = direct chase)
+        # desired horizontal direction from path (fallback = chase)
         move_dir = self._desired_move_dir(player_rect)
+        if move_dir != 0.0:
+            self.facing = 1 if move_dir > 0 else -1
+            self._dash_dir = self.facing
 
-        # --- dash if blocked by enemy in front (to climb over) ---
+        # dash decision: if blocked by enemy in front OR need to cross a gap quickly
         blocked_by_enemy = self._blocked_by_enemy(move_dir, neighbors)
+        gap_ahead = self._gap_ahead(move_dir, grid)
+        should_dash = (blocked_by_enemy or (gap_ahead and abs(player_rect.centerx - self.pos.x) > TILE_SIZE * 2))
 
-        if (not self.dashing) and self.on_ground and (self.dash_cd <= 0.0) and blocked_by_enemy:
-            # quick burst + small hop so they "climb" instead of blob
-            self.dashing = True
-            self.dash_timer = self.dash_time
-            self.dash_cd = self.dash_cooldown
-            self.vel.x = move_dir * self.dash_speed
-            self.vel.y = -self.dash_hop
+        if (not self.dashing) and should_dash and self.dash_cd <= 0.0:
+            can_dash = self.on_ground or (self.air_dashes_left > 0)
+            if can_dash and move_dir != 0.0:
+                self._start_dash(move_dir)
 
-        # --- movement + physics ---
+        # movement
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0.0:
@@ -102,22 +135,94 @@ class Enemy:
         else:
             self.vel.x = move_dir * self.speed
 
+        # gravity always applies (dash clears vy only at start)
         self.vel.y += GRAVITY * dt
         self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
 
+        # apply movement + world collisions
         pre_vx = self.vel.x
         self._move_x(dt, solids)
         self._move_y(dt, solids)
 
-        # --- jump if blocked by wall while grounded (maze stairs/steps) ---
+        # wall flags (after movement)
+        self._update_wall_flags(solids)
+
+        # coyote / resets
+        if self.on_ground:
+            self.coyote_timer = self.coyote_time
+
+        if self.on_ground and not self.was_on_ground:
+            self.jumps_left = self.max_jumps
+            self.air_dashes_left = self.air_dashes_max
+
+        # wall stick & slide
+        if (self.on_wall_left or self.on_wall_right) and (not self.on_ground) and self.vel.y > 0:
+            self.wall_stick_timer = self.wall_stick_time
+
+        if not self.on_ground and self.vel.y > 0:
+            if (self.on_wall_left and move_dir < 0) or (self.on_wall_right and move_dir > 0):
+                self.vel.y = min(self.vel.y, self.wall_slide_speed)
+
+        # jump decisions (AI)
         blocked_by_wall = (abs(pre_vx) > 1.0 and abs(self.vel.x) < 1e-3)
-        if self.on_ground and (not self.dashing) and self.jump_cd <= 0.0 and blocked_by_wall:
-            self.vel.y = -self.jump_speed
-            self.on_ground = False
-            self.jump_cd = 0.25
+        player_above = player_rect.centery < (self.pos.y - self.radius - TILE_SIZE * 0.25)
+        close_x = abs(player_rect.centerx - self.pos.x) < (TILE_SIZE * 4)
+
+        # jump if:
+        # - blocked by a wall, or
+        # - player is above and close, or
+        # - there's a gap ahead (try to clear), or
+        # - blocked by enemy and dash wasn't available
+        want_jump = blocked_by_wall or (player_above and close_x) or gap_ahead or (blocked_by_enemy and (not self.dashing))
+
+        if want_jump and self.jump_cd <= 0.0:
+            # wall jump if touching wall and in air
+            if (not self.on_ground) and (self.on_wall_left or self.on_wall_right) and self.wall_stick_timer > 0.0:
+                self._do_wall_jump()
+                self.jump_cd = 0.18
+            else:
+                # normal/double jump
+                if (self.on_ground or self.coyote_timer > 0.0) and self.jumps_left > 0:
+                    self._do_jump()
+                    self.jump_cd = 0.16
+                    self.coyote_timer = 0.0
+                elif (not self.on_ground) and self.jumps_left > 0:
+                    self._do_jump()
+                    self.jump_cd = 0.16
+
+        self.was_on_ground = self.on_ground
 
     # ------------------------------------------------------------
-    # Pathfinding
+    # Dash / Jump actions
+    # ------------------------------------------------------------
+    def _start_dash(self, move_dir: float):
+        self.dashing = True
+        self.dash_timer = self.dash_time
+        self.dash_cd = self.dash_cooldown
+
+        if not self.on_ground:
+            self.air_dashes_left -= 1
+
+        self.vel.x = (1 if move_dir > 0 else -1) * self.dash_speed
+        self.vel.y = 0.0
+
+    def _do_jump(self):
+        self.vel.y = -self.jump_speed
+        self.on_ground = False
+        self.jumps_left -= 1
+
+    def _do_wall_jump(self):
+        if self.on_wall_left:
+            self.vel.x = self.wall_jump_x
+        elif self.on_wall_right:
+            self.vel.x = -self.wall_jump_x
+        self.vel.y = -self.wall_jump_y
+        self.wall_stick_timer = 0.0
+        if self.jumps_left == self.max_jumps:
+            self.jumps_left -= 1
+
+    # ------------------------------------------------------------
+    # Pathfinding (tile BFS)
     # ------------------------------------------------------------
     def _pathfind_update(self, dt: float, player_rect: pygame.Rect, grid: List[str]):
         self.repath_timer -= dt
@@ -131,7 +236,6 @@ class Enemy:
         player_cell = self._world_to_cell(player_rect.centerx, player_rect.centery)
         enemy_cell = self._world_to_cell(self.pos.x, self.pos.y)
 
-        # force replan if player moved to a new tile or timer elapsed or path invalid
         need_repath = False
         if self._last_player_cell != player_cell:
             need_repath = True
@@ -153,20 +257,18 @@ class Enemy:
                 self.path_index = 0
 
     def _desired_move_dir(self, player_rect: pygame.Rect) -> float:
-        # follow the next cell center in the path
         if self.path and self.path_index < len(self.path):
             tx, ty = self.path[self.path_index]
             target = self._cell_center(tx, ty)
             dx = target.x - self.pos.x
 
-            # advance to next waypoint if close
-            if abs(dx) < (TILE_SIZE * 0.25) and abs(target.y - self.pos.y) < (TILE_SIZE * 0.6):
+            if abs(dx) < (TILE_SIZE * 0.25) and abs(target.y - self.pos.y) < (TILE_SIZE * 0.7):
                 self.path_index = min(self.path_index + 1, len(self.path))
+
             if abs(dx) > 6:
                 return 1.0 if dx > 0 else -1.0
             return 0.0
 
-        # fallback: direct chase
         dx = player_rect.centerx - self.pos.x
         if abs(dx) > 6:
             return 1.0 if dx > 0 else -1.0
@@ -184,7 +286,6 @@ class Enemy:
         if not (0 <= gx < cols and 0 <= gy < rows):
             return None
 
-        # if goal is inside a wall, try a nearby walkable cell
         if not self._is_walkable(grid, gx, gy):
             found = self._nearest_walkable(grid, gx, gy, radius=3)
             if found is None:
@@ -218,7 +319,6 @@ class Enemy:
         if (gx, gy) not in came_from:
             return None
 
-        # reconstruct
         path_rev: List[Tuple[int, int]] = []
         cur: Optional[Tuple[int, int]] = (gx, gy)
         while cur is not None:
@@ -227,7 +327,6 @@ class Enemy:
 
         path_rev.reverse()
 
-        # skip the first cell if it's our current cell
         if path_rev and path_rev[0] == (sx, sy):
             path_rev = path_rev[1:]
 
@@ -250,10 +349,7 @@ class Enemy:
 
     def _is_walkable(self, grid: List[str], x: int, y: int) -> bool:
         ch = grid[y][x]
-        if ch in SOLIDS:
-            return False
-        # treat everything else as walkable floor-space
-        return True
+        return ch not in SOLIDS
 
     def _world_to_cell(self, wx: float, wy: float) -> Tuple[int, int]:
         return int(wx // TILE_SIZE), int(wy // TILE_SIZE)
@@ -262,14 +358,36 @@ class Enemy:
         return pygame.Vector2(cx * TILE_SIZE + TILE_SIZE * 0.5, cy * TILE_SIZE + TILE_SIZE * 0.5)
 
     # ------------------------------------------------------------
-    # Enemy blocking probe
+    # AI helpers: gap & enemy probe
     # ------------------------------------------------------------
+    def _gap_ahead(self, move_dir: float, grid: List[str]) -> bool:
+        if move_dir == 0.0:
+            return False
+
+        rows = len(grid)
+        cols = len(grid[0]) if rows else 0
+        if rows == 0 or cols == 0:
+            return False
+
+        # look one tile ahead at foot position; if below is NOT solid, it's a gap
+        foot_x = self.pos.x + (move_dir * self.radius * 1.2)
+        foot_y = self.pos.y + self.radius + 2
+
+        cx = int(foot_x // TILE_SIZE)
+        cy = int(foot_y // TILE_SIZE)
+        below_y = cy
+
+        if not (0 <= cx < cols and 0 <= below_y < rows):
+            return True
+
+        ch = grid[below_y][cx]
+        return ch not in SOLIDS
+
     def _blocked_by_enemy(self, move_dir: float, neighbors) -> bool:
         if move_dir == 0.0:
             return False
 
-        my_r = self.rect
-        probe = my_r.copy()
+        probe = self.rect.copy()
         probe.x += int(move_dir * (self.radius + 8))
         probe.y += int(self.radius * 0.25)
         probe.height = int(self.radius * 1.2)
@@ -311,6 +429,23 @@ class Enemy:
                     self.vel.y = 0.0
                 r = self.rect
 
+    def _update_wall_flags(self, solids):
+        self.on_wall_left = False
+        self.on_wall_right = False
+        if self.on_ground:
+            return
+
+        left_probe = self.rect.move(-1, 0)
+        right_probe = self.rect.move(1, 0)
+
+        for s in solids:
+            if left_probe.colliderect(s):
+                self.on_wall_left = True
+            if right_probe.colliderect(s):
+                self.on_wall_right = True
+            if self.on_wall_left and self.on_wall_right:
+                break
+
     # ------------------------------------------------------------
     # Draw
     # ------------------------------------------------------------
@@ -323,7 +458,6 @@ class Enemy:
 
         pygame.draw.circle(surf, (240, 120, 120), (cx, cy), self.radius)
 
-        # health bar
         bar_w = 40
         bar_h = 6
         pct = max(0.0, min(1.0, self.health / self.max_health))
