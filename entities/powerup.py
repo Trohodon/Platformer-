@@ -1,7 +1,6 @@
 # entities/powerup.py
 import pygame
 import math
-from core.settings import TILE_SIZE
 from world.powerup_defs import POWERUPS
 
 
@@ -13,7 +12,7 @@ class PowerUp:
         self.alive = True
         self.t = 0.0
 
-        p = POWERUPS.get(power_id, None)
+        p = POWERUPS.get(power_id)
         self.color = p["color"] if p else (200, 200, 200)
 
     @property
@@ -32,19 +31,18 @@ class PowerUp:
         if not self.alive:
             return
 
-        r = self.rect
-        rr = camera.apply(r)
+        rr = camera.apply(self.rect)
         cx, cy = rr.center
+        cy += int(math.sin(self.t * 3.5) * 4)
 
-        # bob + glow
-        bob = int(math.sin(self.t * 3.5) * 4)
-        cy += bob
-
-        # outer glow
         pygame.draw.circle(surf, (*self.color, 60), (cx, cy), self.radius + 8)
         pygame.draw.circle(surf, (*self.color, 120), (cx, cy), self.radius + 4)
 
-        # body (diamond-ish)
-        pts = [(cx, cy - self.radius), (cx + self.radius, cy), (cx, cy + self.radius), (cx - self.radius, cy)]
+        pts = [
+            (cx, cy - self.radius),
+            (cx + self.radius, cy),
+            (cx, cy + self.radius),
+            (cx - self.radius, cy),
+        ]
         pygame.draw.polygon(surf, self.color, pts)
         pygame.draw.polygon(surf, (20, 20, 26), pts, 2)
