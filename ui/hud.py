@@ -4,32 +4,19 @@ from world.powerup_defs import POWERUPS
 
 
 class HUD:
-    """
-    Robust HUD:
-    - Handles accidental HUD(assets) calls by coercing font_size safely
-    - Fixes Level.player bug (must be level.player)
-    - Shows HP bar, wave, and top powerup stacks
-    """
-
     def __init__(self, font_size: int = 18):
         pygame.font.init()
-
-        # If caller accidentally does HUD(assets) or HUD(something_not_int),
-        # force a sane default instead of crashing.
         try:
             fs = int(font_size)
         except Exception:
             fs = 18
-
         fs = max(10, min(48, fs))
         self.font = pygame.font.SysFont("consolas", fs)
 
-    def draw(self, surf: pygame.Surface, level):
-        p = level.player  # FIX: was Level.player
+    def draw(self, surf: pygame.Surface, level, fps: float = 0.0):
+        p = level.player
 
-        # -------------------------
-        # Health Bar
-        # -------------------------
+        # HP bar
         w = 240
         h = 16
         x = 14
@@ -44,24 +31,18 @@ class HUD:
         pygame.draw.rect(surf, (80, 210, 120), (x, y, fill, h))
         pygame.draw.rect(surf, (230, 230, 240), (x, y, w, h), 2)
 
-        txt = self.font.render(f"HP {hp}/{max_hp}", True, (235, 235, 245))
-        surf.blit(txt, (x, y + 20))
+        surf.blit(self.font.render(f"HP {hp}/{max_hp}", True, (235, 235, 245)), (x, y + 20))
 
-        # -------------------------
-        # Wave
-        # -------------------------
-        wave_num = 1
-        try:
-            wave_num = int(level.waves.wave_number)
-        except Exception:
-            pass
+        # Wave + perf
+        wave_num = getattr(level.waves, "wave_number", 1)
+        enemies = len(getattr(level, "enemies", []))
+        bullets = len(getattr(level, "bullets", []))
 
-        txt2 = self.font.render(f"WAVE {wave_num}", True, (235, 235, 245))
-        surf.blit(txt2, (x + 260, y))
+        surf.blit(self.font.render(f"WAVE {wave_num}", True, (235, 235, 245)), (x + 260, y))
+        surf.blit(self.font.render(f"FPS {fps:.0f}", True, (235, 235, 245)), (x + 260, y + 20))
+        surf.blit(self.font.render(f"E {enemies}  B {bullets}", True, (210, 210, 225)), (x + 260, y + 40))
 
-        # -------------------------
-        # Powerup stacks (top 8)
-        # -------------------------
+        # powerup stacks
         stacks = {}
         try:
             stacks = dict(getattr(p, "abilities").stacks)
@@ -75,6 +56,5 @@ class HUD:
         yy = y + 44
         for pid, count in items:
             name = POWERUPS.get(pid, {}).get("name", pid)
-            t = self.font.render(f"{name} x{count}", True, (210, 210, 225))
-            surf.blit(t, (x, yy))
+            surf.blit(self.font.render(f"{name} x{count}", True, (210, 210, 225)), (x, yy))
             yy += 18
