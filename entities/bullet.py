@@ -10,7 +10,7 @@ class Bullet:
 
         self.radius = 4
         self.alive = True
-        self.life = 1.2  # seconds
+        self.life = 1.25  # seconds
 
     @property
     def rect(self) -> pygame.Rect:
@@ -42,9 +42,6 @@ class Bullet:
         if not self.alive:
             return
 
-        # Your Camera supports apply(rect), not apply_point
-        rr = self.rect
-        rr_screen = camera.apply(rr)
-        cx, cy = rr_screen.center
-
+        rr = camera.apply(self.rect)
+        cx, cy = rr.center
         pygame.draw.circle(surf, (220, 220, 120), (cx, cy), self.radius)
