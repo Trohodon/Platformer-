@@ -1,6 +1,6 @@
 # entities/player.py
 import pygame
-from typing import Optional
+from typing import Optional, Any
 
 from core.abilities import Abilities
 from entities.bullet import Bullet
@@ -8,6 +8,26 @@ from entities.bullet import Bullet
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
+
+
+def _get_bool(obj: Any, name: str, default: bool = False) -> bool:
+    """
+    Supports:
+      - obj.name attribute
+      - obj[name] dict key
+      - missing -> default
+    """
+    if obj is None:
+        return default
+    if hasattr(obj, name):
+        try:
+            return bool(getattr(obj, name))
+        except Exception:
+            return default
+    if isinstance(obj, dict):
+        if name in obj:
+            return bool(obj.get(name))
+    return default
 
 
 class Player:
@@ -29,7 +49,7 @@ class Player:
         self.shoot_cd = 0.0
 
         # jumping
-        self.jumps_left = self.abilities.max_jumps
+        self.jumps_left = max(0, self.abilities.max_jumps - 1)
         self.jump_buffer = 0.0
         self.coyote = 0.0
 
@@ -66,40 +86,66 @@ class Player:
         vy = 0.0
         return Bullet(bx, by, vx, vy, damage=self.abilities.bullet_damage)
 
-    def update(self, dt: float, input_state,
-               jump_pressed: bool, jump_released: bool, jump_held: bool,
-               dash_pressed: bool,
-               solids):
-
-        # refresh derived caps (in case powerups changed)
+    def update(
+        self,
+        dt: float,
+        input_state,
+        jump_pressed: bool,
+        jump_released: bool,
+        jump_held: bool,
+        dash_pressed: bool,
+        solids,
+    ):
+        # refresh derived caps (powerups)
         new_max = self.abilities.max_health
         if new_max != self.max_health:
             self.max_health = new_max
             self.health = min(self.health, self.max_health)
 
+        # timers
         if self.hurt_timer > 0.0:
             self.hurt_timer = max(0.0, self.hurt_timer - dt)
-
         if self.shoot_cd > 0.0:
             self.shoot_cd = max(0.0, self.shoot_cd - dt)
-
         if self.dash_cd > 0.0:
             self.dash_cd = max(0.0, self.dash_cd - dt)
 
-        # small regen
+        # regen
         if self.abilities.regen_per_sec > 0.0 and self.health > 0:
-            self.health = min(self.max_health, int(self.health + self.abilities.regen_per_sec * dt))
+            self.health = min(
+                self.max_health,
+                int(self.health + self.abilities.regen_per_sec * dt),
+            )
 
-        # input
+        # -------------------------
+        # Input (robust)
+        # -------------------------
+        # If caller passed keys array from pygame.key.get_pressed()
+        if isinstance(input_state, (list, tuple)) and len(input_state) > 200:
+            keys = input_state
+            left = keys[pygame.K_LEFT] or keys[pygame.K_a]
+            right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
+        else:
+            # Accept various field names
+            left = _get_bool(input_state, "left") or _get_bool(input_state, "move_left")
+            right = _get_bool(input_state, "right") or _get_bool(input_state, "move_right")
+
+            # If the project uses a/d directly
+            left = left or _get_bool(input_state, "a")
+            right = right or _get_bool(input_state, "d")
+
         move_x = 0
-        if input_state.left:
+        if left:
             move_x -= 1
-        if input_state.right:
+        if right:
             move_x += 1
+
         if move_x != 0:
             self.facing = 1 if move_x > 0 else -1
 
-        # jump buffer + coyote time
+        # -------------------------
+        # Jump buffer + coyote
+        # -------------------------
         if jump_pressed:
             self.jump_buffer = 0.12
         else:
@@ -110,7 +156,9 @@ class Player:
         else:
             self.coyote = max(0.0, self.coyote - dt)
 
-        # dash
+        # -------------------------
+        # Dash
+        # -------------------------
         if dash_pressed and (not self.dashing) and self.dash_cd <= 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
             if can_dash:
@@ -128,19 +176,31 @@ class Player:
                 self.dashing = False
                 self.dash_cd = self.abilities.dash_cooldown
         else:
-            # acceleration feel
+            # -------------------------
+            # Horizontal movement
+            # -------------------------
             target = move_x * self.abilities.run_speed
-            accel = 2400.0 * self.abilities.air_control
-            if self.on_ground:
-                accel = 3600.0
-            self.vel.x += (target - self.vel.x) * clamp(accel * dt / max(1.0, abs(target - self.vel.x) + 1.0), 0.0, 1.0)
 
-            # gravity
+            # Smooth accel; stronger on ground, weaker in air
+            accel = 3600.0 if self.on_ground else (2400.0 * self.abilities.air_control)
+
+            # "approach" without weird division artifacts
+            diff = target - self.vel.x
+            step = accel * dt
+            if diff > step:
+                diff = step
+            elif diff < -step:
+                diff = -step
+            self.vel.x += diff
+
+            # -------------------------
+            # Gravity
+            # -------------------------
             self.vel.y = min(self.max_fall, self.vel.y + self.gravity * dt)
 
-            # attempt buffered jump
+            # Buffered jump
             if self.jump_buffer > 0.0:
-                can_jump = self.on_ground or self.coyote > 0.0 or (self.jumps_left > 0)
+                can_jump = self.on_ground or (self.coyote > 0.0) or (self.jumps_left > 0)
                 if can_jump:
                     if not (self.on_ground or self.coyote > 0.0):
                         self.jumps_left -= 1
@@ -153,15 +213,18 @@ class Player:
         if jump_released and self.vel.y < 0:
             self.vel.y *= 0.55
 
-        # move and collide
+        # -------------------------
+        # Move + collide
+        # -------------------------
         self._move_and_collide(dt, solids)
 
-        # reset jump/dash stocks on ground
+        # reset stocks on ground
         if self.on_ground:
             self.jumps_left = max(0, self.abilities.max_jumps - 1)
             self.air_dashes_left = self.abilities.air_dashes_max
 
     def _move_and_collide(self, dt: float, solids):
+        # X
         self.pos.x += self.vel.x * dt
         self.rect.x = int(self.pos.x)
 
@@ -174,6 +237,7 @@ class Player:
                 self.pos.x = self.rect.x
                 self.vel.x = 0.0
 
+        # Y
         self.pos.y += self.vel.y * dt
         self.rect.y = int(self.pos.y)
 
@@ -190,11 +254,6 @@ class Player:
 
     def draw(self, surf: pygame.Surface, camera):
         rr = camera.apply(self.rect)
-
-        # hurt flash
-        col = (230, 230, 240)
-        if self.hurt_timer > 0.0:
-            col = (255, 180, 180)
-
+        col = (230, 230, 240) if self.hurt_timer <= 0.0 else (255, 180, 180)
         pygame.draw.rect(surf, col, rr)
         pygame.draw.rect(surf, (20, 20, 26), rr, 2)
