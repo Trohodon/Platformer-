@@ -1,6 +1,6 @@
 # entities/player.py
 import pygame
-from typing import Optional, Any
+from typing import Optional
 
 from core.abilities import Abilities
 from entities.bullet import Bullet
@@ -8,26 +8,6 @@ from entities.bullet import Bullet
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
-
-
-def _get_bool(obj: Any, name: str, default: bool = False) -> bool:
-    """
-    Supports:
-      - obj.name attribute
-      - obj[name] dict key
-      - missing -> default
-    """
-    if obj is None:
-        return default
-    if hasattr(obj, name):
-        try:
-            return bool(getattr(obj, name))
-        except Exception:
-            return default
-    if isinstance(obj, dict):
-        if name in obj:
-            return bool(obj.get(name))
-    return default
 
 
 class Player:
@@ -67,7 +47,6 @@ class Player:
     def take_damage(self, amount: int) -> bool:
         if self.hurt_timer > 0.0:
             return False
-
         dmg = int(max(1, int(amount) * self.abilities.damage_taken_mult))
         self.health = max(0, self.health - dmg)
         self.hurt_timer = self.abilities.i_frames
@@ -89,7 +68,7 @@ class Player:
     def update(
         self,
         dt: float,
-        input_state,
+        input_state,  # kept for compatibility; movement ignores it
         jump_pressed: bool,
         jump_released: bool,
         jump_held: bool,
@@ -118,21 +97,11 @@ class Player:
             )
 
         # -------------------------
-        # Input (robust)
+        # Movement input (HARD FIX)
         # -------------------------
-        # If caller passed keys array from pygame.key.get_pressed()
-        if isinstance(input_state, (list, tuple)) and len(input_state) > 200:
-            keys = input_state
-            left = keys[pygame.K_LEFT] or keys[pygame.K_a]
-            right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
-        else:
-            # Accept various field names
-            left = _get_bool(input_state, "left") or _get_bool(input_state, "move_left")
-            right = _get_bool(input_state, "right") or _get_bool(input_state, "move_right")
-
-            # If the project uses a/d directly
-            left = left or _get_bool(input_state, "a")
-            right = right or _get_bool(input_state, "d")
+        keys = pygame.key.get_pressed()
+        left = keys[pygame.K_LEFT] or keys[pygame.K_a]
+        right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
 
         move_x = 0
         if left:
@@ -176,15 +145,10 @@ class Player:
                 self.dashing = False
                 self.dash_cd = self.abilities.dash_cooldown
         else:
-            # -------------------------
-            # Horizontal movement
-            # -------------------------
+            # horizontal acceleration
             target = move_x * self.abilities.run_speed
-
-            # Smooth accel; stronger on ground, weaker in air
             accel = 3600.0 if self.on_ground else (2400.0 * self.abilities.air_control)
 
-            # "approach" without weird division artifacts
             diff = target - self.vel.x
             step = accel * dt
             if diff > step:
@@ -193,12 +157,10 @@ class Player:
                 diff = -step
             self.vel.x += diff
 
-            # -------------------------
-            # Gravity
-            # -------------------------
+            # gravity
             self.vel.y = min(self.max_fall, self.vel.y + self.gravity * dt)
 
-            # Buffered jump
+            # buffered jump
             if self.jump_buffer > 0.0:
                 can_jump = self.on_ground or (self.coyote > 0.0) or (self.jumps_left > 0)
                 if can_jump:
@@ -209,13 +171,11 @@ class Player:
                     self.coyote = 0.0
                     self.jump_buffer = 0.0
 
-        # jump cut (variable height)
+        # variable jump height
         if jump_released and self.vel.y < 0:
             self.vel.y *= 0.55
 
-        # -------------------------
-        # Move + collide
-        # -------------------------
+        # move + collide
         self._move_and_collide(dt, solids)
 
         # reset stocks on ground
