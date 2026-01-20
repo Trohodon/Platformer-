@@ -2,248 +2,199 @@
 import pygame
 from typing import Optional
 
-from core.settings import (
-    GRAVITY, MAX_FALL_SPEED, MOVE_SPEED, JUMP_SPEED, PLAYER_COLOR,
-    DASH_SPEED, DASH_TIME, DASH_COOLDOWN, AIR_DASHES,
-    WALL_SLIDE_SPEED, WALL_JUMP_X, WALL_JUMP_Y, WALL_STICK_TIME
-)
-from core.utils import clamp
+from core.abilities import Abilities
 from entities.bullet import Bullet
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
 
 
 class Player:
     def __init__(self, x: float, y: float):
-        self.rect = pygame.Rect(int(x), int(y), 32, 44)
+        self.rect = pygame.Rect(int(x), int(y), 22, 34)
+        self.pos = pygame.Vector2(self.rect.x, self.rect.y)
         self.vel = pygame.Vector2(0, 0)
+
         self.on_ground = False
-
-        # ---------- Health ----------
-        self.max_health = 100
-        self.health = 100
-        self.hurt_iframes = 0.40
-        self.hurt_timer = 0.0
-
-        # ---------- Weapon ----------
-        self.shoot_cd = 0.0
-        self.shoot_rate = 0.18
-        self.shot_speed = 900.0
         self.facing = 1  # -1 left, +1 right
 
-        # ---------- Jumping ----------
-        self.max_jumps = 2
-        self.jumps_left = self.max_jumps
+        self.abilities = Abilities()
 
-        self.coyote_time = 0.10
-        self.coyote_timer = 0.0
+        self.max_health = self.abilities.max_health
+        self.health = self.max_health
 
-        self.jump_buffer_time = 0.12
-        self.jump_buffer_timer = 0.0
+        # timers
+        self.hurt_timer = 0.0
+        self.shoot_cd = 0.0
 
-        self.jump_cut_multiplier = 0.45
-        self.was_on_ground = False
+        # jumping
+        self.jumps_left = self.abilities.max_jumps
+        self.jump_buffer = 0.0
+        self.coyote = 0.0
 
-        # ---------- Wall ----------
-        self.on_wall_left = False
-        self.on_wall_right = False
-        self.wall_stick_timer = 0.0
-
-        # ---------- Dash ----------
+        # dash
         self.dashing = False
         self.dash_timer = 0.0
-        self.dash_cooldown = 0.0
-        self.air_dashes_left = AIR_DASHES
-        self._dash_dir = 1
+        self.dash_cd = 0.0
+        self.air_dashes_left = self.abilities.air_dashes_max
+        self.dash_dir = 1
 
-    # ==========================================================
-    # Combat
-    # ==========================================================
+        # physics feel
+        self.gravity = 2200.0
+        self.max_fall = 1200.0
+
     def take_damage(self, amount: int) -> bool:
         if self.hurt_timer > 0.0:
             return False
-        self.health = max(0, self.health - int(amount))
-        self.hurt_timer = self.hurt_iframes
+
+        dmg = int(max(1, int(amount) * self.abilities.damage_taken_mult))
+        self.health = max(0, self.health - dmg)
+        self.hurt_timer = self.abilities.i_frames
         return True
 
-    def try_shoot(self) -> Optional["Bullet"]:
+    def try_shoot(self) -> Optional[Bullet]:
         if self.shoot_cd > 0.0:
             return None
 
-        self.shoot_cd = self.shoot_rate
+        self.shoot_cd = self.abilities.fire_rate
 
-        bx = self.rect.centerx + (self.facing * (self.rect.width // 2 + 6))
+        bx = self.rect.centerx + (self.facing * 10)
         by = self.rect.centery - 6
 
-        vx = self.facing * self.shot_speed
+        vx = self.facing * self.abilities.bullet_speed
         vy = 0.0
+        return Bullet(bx, by, vx, vy, damage=self.abilities.bullet_damage)
 
-        return Bullet(bx, by, vx, vy, damage=20)
+    def update(self, dt: float, input_state,
+               jump_pressed: bool, jump_released: bool, jump_held: bool,
+               dash_pressed: bool,
+               solids):
 
-    # ==========================================================
-    # Update Loop
-    # ==========================================================
-    def update(
-        self,
-        dt: float,
-        input_state,
-        jump_pressed: bool,
-        jump_released: bool,
-        jump_held: bool,
-        dash_pressed: bool,
-        solids
-    ):
-        # timers
-        self.jump_buffer_timer = max(0.0, self.jump_buffer_timer - dt)
-        self.coyote_timer = max(0.0, self.coyote_timer - dt)
-        self.dash_cooldown = max(0.0, self.dash_cooldown - dt)
-        self.wall_stick_timer = max(0.0, self.wall_stick_timer - dt)
-        self.hurt_timer = max(0.0, self.hurt_timer - dt)
-        self.shoot_cd = max(0.0, self.shoot_cd - dt)
+        # refresh derived caps (in case powerups changed)
+        new_max = self.abilities.max_health
+        if new_max != self.max_health:
+            self.max_health = new_max
+            self.health = min(self.health, self.max_health)
 
-        # horizontal input
-        move = 0.0
-        if input_state.left():
-            move -= 1.0
-        if input_state.right():
-            move += 1.0
+        if self.hurt_timer > 0.0:
+            self.hurt_timer = max(0.0, self.hurt_timer - dt)
 
-        if move != 0:
-            self.facing = 1 if move > 0 else -1
-            self._dash_dir = self.facing
+        if self.shoot_cd > 0.0:
+            self.shoot_cd = max(0.0, self.shoot_cd - dt)
 
-        # jump buffer
+        if self.dash_cd > 0.0:
+            self.dash_cd = max(0.0, self.dash_cd - dt)
+
+        # small regen
+        if self.abilities.regen_per_sec > 0.0 and self.health > 0:
+            self.health = min(self.max_health, int(self.health + self.abilities.regen_per_sec * dt))
+
+        # input
+        move_x = 0
+        if input_state.left:
+            move_x -= 1
+        if input_state.right:
+            move_x += 1
+        if move_x != 0:
+            self.facing = 1 if move_x > 0 else -1
+
+        # jump buffer + coyote time
         if jump_pressed:
-            self.jump_buffer_timer = self.jump_buffer_time
+            self.jump_buffer = 0.12
+        else:
+            self.jump_buffer = max(0.0, self.jump_buffer - dt)
+
+        if self.on_ground:
+            self.coyote = 0.10
+        else:
+            self.coyote = max(0.0, self.coyote - dt)
 
         # dash
-        if dash_pressed and (not self.dashing) and self.dash_cooldown <= 0.0:
+        if dash_pressed and (not self.dashing) and self.dash_cd <= 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
             if can_dash:
                 self.dashing = True
-                self.dash_timer = DASH_TIME
-                self.dash_cooldown = DASH_COOLDOWN
+                self.dash_timer = self.abilities.dash_time
+                self.dash_dir = self.facing if move_x == 0 else (1 if move_x > 0 else -1)
+                self.vel.y = 0.0
+                self.vel.x = self.dash_dir * self.abilities.dash_speed
                 if not self.on_ground:
                     self.air_dashes_left -= 1
-                self.vel.x = self._dash_dir * DASH_SPEED
-                self.vel.y = 0.0
 
-        # physics
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0.0:
                 self.dashing = False
-            self._move_x(dt, solids)
-            self._move_y(dt, solids)
+                self.dash_cd = self.abilities.dash_cooldown
         else:
-            self.vel.x = move * MOVE_SPEED
-            self.vel.y += GRAVITY * dt
-            self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
-            self._move_x(dt, solids)
-            self._move_y(dt, solids)
+            # acceleration feel
+            target = move_x * self.abilities.run_speed
+            accel = 2400.0 * self.abilities.air_control
+            if self.on_ground:
+                accel = 3600.0
+            self.vel.x += (target - self.vel.x) * clamp(accel * dt / max(1.0, abs(target - self.vel.x) + 1.0), 0.0, 1.0)
 
-        # wall detection
-        self._update_wall_flags(solids)
+            # gravity
+            self.vel.y = min(self.max_fall, self.vel.y + self.gravity * dt)
 
-        # coyote time
-        if self.on_ground:
-            self.coyote_timer = self.coyote_time
+            # attempt buffered jump
+            if self.jump_buffer > 0.0:
+                can_jump = self.on_ground or self.coyote > 0.0 or (self.jumps_left > 0)
+                if can_jump:
+                    if not (self.on_ground or self.coyote > 0.0):
+                        self.jumps_left -= 1
+                    self.vel.y = -self.abilities.jump_speed
+                    self.on_ground = False
+                    self.coyote = 0.0
+                    self.jump_buffer = 0.0
 
-        # landing resets
-        if self.on_ground and not self.was_on_ground:
-            self.jumps_left = self.max_jumps
-            self.air_dashes_left = AIR_DASHES
-
-        # wall stick
-        if (self.on_wall_left or self.on_wall_right) and not self.on_ground and self.vel.y > 0:
-            self.wall_stick_timer = WALL_STICK_TIME
-
-        # wall slide
-        if not self.on_ground and self.vel.y > 0:
-            if (self.on_wall_left and input_state.left()) or (
-                self.on_wall_right and input_state.right()
-            ):
-                self.vel.y = min(self.vel.y, WALL_SLIDE_SPEED)
-
-        # consume buffered jump
-        if self.jump_buffer_timer > 0.0:
-            if not self.on_ground and (self.on_wall_left or self.on_wall_right) and self.wall_stick_timer > 0.0:
-                self._do_wall_jump()
-                self.jump_buffer_timer = 0.0
-                self.coyote_timer = 0.0
-            else:
-                if (self.on_ground or self.coyote_timer > 0.0) and self.jumps_left > 0:
-                    self._do_jump()
-                    self.jump_buffer_timer = 0.0
-                    self.coyote_timer = 0.0
-                elif not self.on_ground and self.jumps_left > 0:
-                    self._do_jump()
-                    self.jump_buffer_timer = 0.0
-
-        # variable jump height
+        # jump cut (variable height)
         if jump_released and self.vel.y < 0:
-            self.vel.y *= self.jump_cut_multiplier
+            self.vel.y *= 0.55
 
-        self.was_on_ground = self.on_ground
+        # move and collide
+        self._move_and_collide(dt, solids)
 
-    # ==========================================================
-    # Movement helpers
-    # ==========================================================
-    def _move_x(self, dt: float, solids):
-        self.rect.x += int(self.vel.x * dt)
+        # reset jump/dash stocks on ground
+        if self.on_ground:
+            self.jumps_left = max(0, self.abilities.max_jumps - 1)
+            self.air_dashes_left = self.abilities.air_dashes_max
+
+    def _move_and_collide(self, dt: float, solids):
+        self.pos.x += self.vel.x * dt
+        self.rect.x = int(self.pos.x)
+
         for s in solids:
             if self.rect.colliderect(s):
                 if self.vel.x > 0:
                     self.rect.right = s.left
                 elif self.vel.x < 0:
                     self.rect.left = s.right
+                self.pos.x = self.rect.x
                 self.vel.x = 0.0
 
-    def _move_y(self, dt: float, solids):
-        self.rect.y += int(self.vel.y * dt)
+        self.pos.y += self.vel.y * dt
+        self.rect.y = int(self.pos.y)
+
         self.on_ground = False
         for s in solids:
             if self.rect.colliderect(s):
                 if self.vel.y > 0:
                     self.rect.bottom = s.top
-                    self.vel.y = 0.0
                     self.on_ground = True
                 elif self.vel.y < 0:
                     self.rect.top = s.bottom
-                    self.vel.y = 0.0
+                self.pos.y = self.rect.y
+                self.vel.y = 0.0
 
-    def _update_wall_flags(self, solids):
-        self.on_wall_left = False
-        self.on_wall_right = False
-        if self.on_ground:
-            return
-
-        left_probe = self.rect.move(-1, 0)
-        right_probe = self.rect.move(1, 0)
-
-        for s in solids:
-            if left_probe.colliderect(s):
-                self.on_wall_left = True
-            if right_probe.colliderect(s):
-                self.on_wall_right = True
-            if self.on_wall_left and self.on_wall_right:
-                break
-
-    def _do_jump(self):
-        self.vel.y = -JUMP_SPEED
-        self.on_ground = False
-        self.jumps_left -= 1
-
-    def _do_wall_jump(self):
-        if self.on_wall_left:
-            self.vel.x = WALL_JUMP_X
-        elif self.on_wall_right:
-            self.vel.x = -WALL_JUMP_X
-        self.vel.y = -WALL_JUMP_Y
-        self.wall_stick_timer = 0.0
-        if self.jumps_left == self.max_jumps:
-            self.jumps_left -= 1
-
-    # ==========================================================
-    # Draw
-    # ==========================================================
     def draw(self, surf: pygame.Surface, camera):
-        pygame.draw.rect(surf, PLAYER_COLOR, camera.apply(self.rect))
+        rr = camera.apply(self.rect)
+
+        # hurt flash
+        col = (230, 230, 240)
+        if self.hurt_timer > 0.0:
+            col = (255, 180, 180)
+
+        pygame.draw.rect(surf, col, rr)
+        pygame.draw.rect(surf, (20, 20, 26), rr, 2)
