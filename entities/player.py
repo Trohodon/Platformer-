@@ -11,13 +11,21 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 class Player:
+    """
+    Movement uses pygame.key.get_pressed() (hard-fixed input).
+    Adds wall slide + wall jump:
+      - If you're in the air and touching a wall, you can jump off it.
+      - Wall jump pushes away from the wall and gives an upward boost.
+      - Includes a short "wall lock" so you don't instantly re-stick.
+    """
+
     def __init__(self, x: float, y: float):
         self.rect = pygame.Rect(int(x), int(y), 22, 34)
         self.pos = pygame.Vector2(self.rect.x, self.rect.y)
         self.vel = pygame.Vector2(0, 0)
 
         self.on_ground = False
-        self.facing = 1  # -1 left, +1 right
+        self.facing = 1
 
         self.abilities = Abilities()
 
@@ -44,6 +52,13 @@ class Player:
         self.gravity = 2200.0
         self.max_fall = 1200.0
 
+        # wall mechanics
+        self.wall_dir = 0            # -1 touching wall on left, +1 on right, 0 none
+        self.wall_slide_speed = 320  # clamp fall speed while sliding
+        self.wall_jump_x = 520       # horizontal push
+        self.wall_jump_y_mult = 1.00 # multiplier on normal jump strength
+        self.wall_lock = 0.0         # prevents immediate re-stick after wall jump
+
     def take_damage(self, amount: int) -> bool:
         if self.hurt_timer > 0.0:
             return False
@@ -55,20 +70,16 @@ class Player:
     def try_shoot(self) -> Optional[Bullet]:
         if self.shoot_cd > 0.0:
             return None
-
         self.shoot_cd = self.abilities.fire_rate
-
         bx = self.rect.centerx + (self.facing * 10)
         by = self.rect.centery - 6
-
         vx = self.facing * self.abilities.bullet_speed
-        vy = 0.0
-        return Bullet(bx, by, vx, vy, damage=self.abilities.bullet_damage)
+        return Bullet(bx, by, vx, 0.0, damage=self.abilities.bullet_damage)
 
     def update(
         self,
         dt: float,
-        input_state,  # kept for compatibility; movement ignores it
+        input_state,  # kept for compatibility; movement reads keyboard directly
         jump_pressed: bool,
         jump_released: bool,
         jump_held: bool,
@@ -88,17 +99,14 @@ class Player:
             self.shoot_cd = max(0.0, self.shoot_cd - dt)
         if self.dash_cd > 0.0:
             self.dash_cd = max(0.0, self.dash_cd - dt)
+        if self.wall_lock > 0.0:
+            self.wall_lock = max(0.0, self.wall_lock - dt)
 
         # regen
         if self.abilities.regen_per_sec > 0.0 and self.health > 0:
-            self.health = min(
-                self.max_health,
-                int(self.health + self.abilities.regen_per_sec * dt),
-            )
+            self.health = min(self.max_health, int(self.health + self.abilities.regen_per_sec * dt))
 
-        # -------------------------
-        # Movement input (HARD FIX)
-        # -------------------------
+        # movement input
         keys = pygame.key.get_pressed()
         left = keys[pygame.K_LEFT] or keys[pygame.K_a]
         right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
@@ -108,13 +116,10 @@ class Player:
             move_x -= 1
         if right:
             move_x += 1
-
         if move_x != 0:
             self.facing = 1 if move_x > 0 else -1
 
-        # -------------------------
-        # Jump buffer + coyote
-        # -------------------------
+        # jump buffer + coyote
         if jump_pressed:
             self.jump_buffer = 0.12
         else:
@@ -125,9 +130,7 @@ class Player:
         else:
             self.coyote = max(0.0, self.coyote - dt)
 
-        # -------------------------
-        # Dash
-        # -------------------------
+        # dash
         if dash_pressed and (not self.dashing) and self.dash_cd <= 0.0:
             can_dash = self.on_ground or (self.air_dashes_left > 0)
             if can_dash:
@@ -139,15 +142,46 @@ class Player:
                 if not self.on_ground:
                     self.air_dashes_left -= 1
 
+        # wall detection (requires current rect + solids)
+        if self.wall_lock <= 0.0 and (not self.on_ground):
+            self.wall_dir = self._detect_wall(solids)
+        else:
+            self.wall_dir = 0
+
+        # wall slide clamp (only if moving downward)
+        if self.wall_dir != 0 and self.vel.y > self.wall_slide_speed:
+            self.vel.y = self.wall_slide_speed
+
+        # perform wall jump if buffered and on wall
+        # priority: wall jump -> normal jump
+        if self.jump_buffer > 0.0 and self.wall_dir != 0 and not self.on_ground:
+            # push away from wall
+            away = -self.wall_dir
+            self.vel.x = away * self.wall_jump_x
+            self.vel.y = -self.abilities.jump_speed * self.wall_jump_y_mult
+
+            # give a brief lock so you don't re-stick instantly
+            self.wall_lock = 0.16
+            self.wall_dir = 0
+
+            # reset buffer and allow extra jumps after wall jump
+            self.jump_buffer = 0.0
+            self.jumps_left = max(0, self.abilities.max_jumps - 1)
+
+        # dash update / normal movement
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0.0:
                 self.dashing = False
                 self.dash_cd = self.abilities.dash_cooldown
         else:
-            # horizontal acceleration
+            # horizontal accel
             target = move_x * self.abilities.run_speed
             accel = 3600.0 if self.on_ground else (2400.0 * self.abilities.air_control)
+
+            # while on wall, slightly reduce "stickiness" if pushing into wall
+            if self.wall_dir != 0 and ((move_x < 0 and self.wall_dir < 0) or (move_x > 0 and self.wall_dir > 0)):
+                accel *= 0.45
 
             diff = target - self.vel.x
             step = accel * dt
@@ -160,7 +194,7 @@ class Player:
             # gravity
             self.vel.y = min(self.max_fall, self.vel.y + self.gravity * dt)
 
-            # buffered jump
+            # normal buffered jump
             if self.jump_buffer > 0.0:
                 can_jump = self.on_ground or (self.coyote > 0.0) or (self.jumps_left > 0)
                 if can_jump:
@@ -182,6 +216,35 @@ class Player:
         if self.on_ground:
             self.jumps_left = max(0, self.abilities.max_jumps - 1)
             self.air_dashes_left = self.abilities.air_dashes_max
+
+    def _detect_wall(self, solids) -> int:
+        """
+        Returns:
+          -1 if touching wall on left
+          +1 if touching wall on right
+           0 otherwise
+        Uses a 1px probe on each side.
+        """
+        # probe rectangles
+        left_probe = pygame.Rect(self.rect.left - 1, self.rect.top + 2, 1, self.rect.height - 4)
+        right_probe = pygame.Rect(self.rect.right, self.rect.top + 2, 1, self.rect.height - 4)
+
+        hit_left = False
+        hit_right = False
+
+        for s in solids:
+            if left_probe.colliderect(s):
+                hit_left = True
+            if right_probe.colliderect(s):
+                hit_right = True
+            if hit_left and hit_right:
+                break
+
+        if hit_left and not hit_right:
+            return -1
+        if hit_right and not hit_left:
+            return +1
+        return 0
 
     def _move_and_collide(self, dt: float, solids):
         # X
