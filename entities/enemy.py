@@ -1,78 +1,57 @@
 # entities/enemy.py
 import pygame
-from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
-
-from core.settings import GRAVITY, MAX_FALL_SPEED, TILE_SIZE
-from core.utils import clamp
-
-
-SOLIDS = {"#", "C", "M"}  # must match your Tilemap solid set
+import random
 
 
 class Enemy:
     """
-    Enemy with a player-like kit:
-    - Double jump
-    - Dash (limited air dash)
-    - Wall slide + wall jump
-    - BFS pathfinding on the grid
-    - Spike avoidance: detects spikes ahead and jumps/dashes over them
-    NOTE: spike damage is applied in Level (same as player).
+    Performance-friendly enemy:
+    - Uses FlowField direction instead of per-enemy pathfinding
+    - Has player-like abilities: jump, dash, wall-slide-ish behavior
+    - Solid circle body; resolves collisions with nearby enemies (handled in Level via buckets)
     """
 
-    def __init__(self, x: float, y: float, radius: int = 16):
+    def __init__(self, x: float, y: float, radius: int = 16, kind: str = "grunt"):
+        self.kind = kind
+        self.radius = int(radius)
+
         self.pos = pygame.Vector2(x, y)
         self.vel = pygame.Vector2(0, 0)
-        self.radius = radius
 
-        # health
-        self.max_health = 60
-        self.health = 60
-        self.dead = False
-
-        # movement tuning
-        self.speed = 205.0
-        self.jump_speed = 760.0
-
-        # jump kit
-        self.max_jumps = 2
-        self.jumps_left = self.max_jumps
-        self.coyote_time = 0.10
-        self.coyote_timer = 0.0
-        self.jump_cd = 0.0
-
-        # wall kit
-        self.on_wall_left = False
-        self.on_wall_right = False
-        self.wall_slide_speed = 420.0
-        self.wall_jump_x = 420.0
-        self.wall_jump_y = 760.0
-        self.wall_stick_time = 0.10
-        self.wall_stick_timer = 0.0
-
-        # dash kit
-        self.dashing = False
-        self.dash_timer = 0.0
-        self.dash_time = 0.14
-        self.dash_speed = 520.0
-        self.dash_cooldown = 0.55
-        self.dash_cd = 0.0
-        self.air_dashes_max = 1
-        self.air_dashes_left = self.air_dashes_max
-        self._dash_dir = 1
-
-        # state
         self.on_ground = False
-        self.was_on_ground = False
         self.facing = 1
 
-        # pathfinding
-        self.repath_timer = 0.0
-        self.repath_interval = 0.45
-        self.path: List[Tuple[int, int]] = []
-        self.path_index = 0
-        self._last_player_cell: Optional[Tuple[int, int]] = None
+        self.max_health = 60
+        self.health = self.max_health
+        self.dead = False
+
+        # movement feel (similar to player)
+        self.run_speed = 210.0
+        self.jump_speed = 780.0
+        self.gravity = 2200.0
+        self.max_fall = 1150.0
+
+        # dash
+        self.dashing = False
+        self.dash_timer = 0.0
+        self.dash_cd = random.uniform(0.15, 0.35)
+        self.dash_time = 0.10
+        self.dash_speed = 620.0
+        self.air_dashes_left = 1
+
+        # jump control
+        self.jumps_left = 1
+        self.coyote = 0.0
+
+        # wall
+        self.wall_lock = 0.0
+        self.wall_dir = 0
+
+        # brain
+        self._think = random.uniform(0.0, 0.25)
+        self._jump_intent = 0.0
+
+        self.color = (120, 200, 255) if kind == "grunt" else (200, 200, 200)
 
     @property
     def rect(self) -> pygame.Rect:
@@ -83,421 +62,247 @@ class Enemy:
             self.radius * 2
         )
 
-    def take_damage(self, dmg: int):
+    def take_damage(self, amount: int):
         if self.dead:
             return
-        self.health -= int(dmg)
+        self.health -= int(amount)
         if self.health <= 0:
             self.dead = True
 
-    # ------------------------------------------------------------
-    # Update
-    # ------------------------------------------------------------
-    def update(self, dt: float, player_rect: pygame.Rect, solids, grid: List[str], neighbors):
+    def update(self, dt: float, player_rect: pygame.Rect, solids, spikes, flow_dir: pygame.Vector2, enemies_near):
         if self.dead:
             return
 
+        # dt safety to avoid spiral-of-death
+        if dt > 1.0 / 30.0:
+            dt = 1.0 / 30.0
+
         # timers
-        self.jump_cd = max(0.0, self.jump_cd - dt)
-        self.coyote_timer = max(0.0, self.coyote_timer - dt)
-        self.wall_stick_timer = max(0.0, self.wall_stick_timer - dt)
-        self.dash_cd = max(0.0, self.dash_cd - dt)
+        if self.dash_cd > 0.0:
+            self.dash_cd = max(0.0, self.dash_cd - dt)
+        if self.wall_lock > 0.0:
+            self.wall_lock = max(0.0, self.wall_lock - dt)
 
-        # path
-        self._pathfind_update(dt, player_rect, grid)
+        # ground/coyote bookkeeping
+        if self.on_ground:
+            self.coyote = 0.10
+        else:
+            self.coyote = max(0.0, self.coyote - dt)
 
-        # desired direction
-        move_dir = self._desired_move_dir(player_rect)
-        if move_dir != 0.0:
-            self.facing = 1 if move_dir > 0 else -1
-            self._dash_dir = self.facing
+        # think (coarse)
+        self._think -= dt
+        if self._think <= 0.0:
+            self._think = 0.10 + random.random() * 0.12
 
-        # environment probes
-        blocked_by_enemy = self._blocked_by_enemy(move_dir, neighbors)
-        blocked_by_spike = self._spike_ahead(move_dir, grid)  # << key change
-        gap_ahead = self._gap_ahead(move_dir, grid)
+            # choose a desired move direction from flow
+            if flow_dir.length_squared() > 0:
+                self.facing = 1 if flow_dir.x >= 0 else -1
+            else:
+                # fallback: direct chase
+                self.facing = 1 if player_rect.centerx >= self.rect.centerx else -1
 
-        # dash decision
-        should_dash = (
-            (blocked_by_enemy and self.on_ground) or
-            (blocked_by_spike and self.on_ground) or
-            (gap_ahead and abs(player_rect.centerx - self.pos.x) > TILE_SIZE * 2)
-        )
+            # decide if we should jump soon (obstacle / spike / crowd)
+            self._jump_intent = 0.14 if random.random() < 0.35 else 0.0
 
-        if (not self.dashing) and should_dash and self.dash_cd <= 0.0 and move_dir != 0.0:
-            can_dash = self.on_ground or (self.air_dashes_left > 0)
-            if can_dash:
-                self._start_dash(move_dir)
+        # desired movement
+        move_x = 0
+        if flow_dir.length_squared() > 0:
+            if flow_dir.x > 0.15:
+                move_x = 1
+            elif flow_dir.x < -0.15:
+                move_x = -1
+        else:
+            move_x = 1 if player_rect.centerx > self.rect.centerx else -1
 
-        # horizontal movement
+        if move_x != 0:
+            self.facing = 1 if move_x > 0 else -1
+
+        # wall detection (light)
+        if self.wall_lock <= 0.0 and (not self.on_ground):
+            self.wall_dir = self._detect_wall(solids)
+        else:
+            self.wall_dir = 0
+
+        # dash decision:
+        # - if stuck behind another enemy or pushing into wall, dash to "climb over"
+        if (not self.dashing) and self.dash_cd <= 0.0:
+            if self._should_dash(enemies_near, solids, move_x):
+                can_dash = self.on_ground or self.air_dashes_left > 0
+                if can_dash:
+                    self.dashing = True
+                    self.dash_timer = self.dash_time
+                    self.vel.y = 0.0
+                    self.vel.x = self.facing * self.dash_speed
+                    self.dash_cd = 0.25 + random.random() * 0.45
+                    if not self.on_ground:
+                        self.air_dashes_left -= 1
+
+        # jump decision:
+        # - jump if spikes ahead or obstacle ahead or jump_intent timer
+        if self._jump_intent > 0.0:
+            self._jump_intent = max(0.0, self._jump_intent - dt)
+            if self._can_jump() and self._should_jump(solids, spikes, move_x):
+                self._do_jump()
+                self._jump_intent = 0.0
+
+        # physics
         if self.dashing:
             self.dash_timer -= dt
             if self.dash_timer <= 0.0:
                 self.dashing = False
         else:
-            self.vel.x = move_dir * self.speed
+            # horizontal accel
+            target = move_x * self.run_speed
+            accel = 3600.0 if self.on_ground else 2200.0
+            diff = target - self.vel.x
+            step = accel * dt
+            if diff > step:
+                diff = step
+            elif diff < -step:
+                diff = -step
+            self.vel.x += diff
 
-        # gravity
-        self.vel.y += GRAVITY * dt
-        self.vel.y = clamp(self.vel.y, -99999.0, MAX_FALL_SPEED)
+            # gravity
+            self.vel.y = min(self.max_fall, self.vel.y + self.gravity * dt)
 
-        # move/collide
-        pre_vx = self.vel.x
-        self._move_x(dt, solids)
-        self._move_y(dt, solids)
+        # move + collide
+        self._move_and_collide(dt, solids)
 
-        # wall flags
-        self._update_wall_flags(solids)
-
-        # coyote / resets
-        if self.on_ground:
-            self.coyote_timer = self.coyote_time
-        if self.on_ground and not self.was_on_ground:
-            self.jumps_left = self.max_jumps
-            self.air_dashes_left = self.air_dashes_max
-
-        # wall stick & slide
-        if (self.on_wall_left or self.on_wall_right) and (not self.on_ground) and self.vel.y > 0:
-            self.wall_stick_timer = self.wall_stick_time
-
-        if not self.on_ground and self.vel.y > 0:
-            if (self.on_wall_left and move_dir < 0) or (self.on_wall_right and move_dir > 0):
-                self.vel.y = min(self.vel.y, self.wall_slide_speed)
-
-        # jump decisions
-        blocked_by_wall = (abs(pre_vx) > 1.0 and abs(self.vel.x) < 1e-3)
-        player_above = player_rect.centery < (self.pos.y - self.radius - TILE_SIZE * 0.25)
-        close_x = abs(player_rect.centerx - self.pos.x) < (TILE_SIZE * 4)
-
-        # spike ahead should cause an early jump even if not blocked yet
-        want_jump = (
-            blocked_by_wall or
-            blocked_by_spike or
-            gap_ahead or
-            (player_above and close_x) or
-            (blocked_by_enemy and (not self.dashing))
-        )
-
-        if want_jump and self.jump_cd <= 0.0:
-            # wall jump if touching wall
-            if (not self.on_ground) and (self.on_wall_left or self.on_wall_right) and self.wall_stick_timer > 0.0:
-                self._do_wall_jump()
-                self.jump_cd = 0.18
-            else:
-                if (self.on_ground or self.coyote_timer > 0.0) and self.jumps_left > 0:
-                    self._do_jump()
-                    self.jump_cd = 0.16
-                    self.coyote_timer = 0.0
-                elif (not self.on_ground) and self.jumps_left > 0:
-                    self._do_jump()
-                    self.jump_cd = 0.16
-
-        self.was_on_ground = self.on_ground
-
-    # ------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------
-    def _start_dash(self, move_dir: float):
-        self.dashing = True
-        self.dash_timer = self.dash_time
-        self.dash_cd = self.dash_cooldown
-
-        if not self.on_ground:
-            self.air_dashes_left -= 1
-
-        self.vel.x = (1 if move_dir > 0 else -1) * self.dash_speed
-        self.vel.y = 0.0
-
-    def _do_jump(self):
-        self.vel.y = -self.jump_speed
-        self.on_ground = False
-        self.jumps_left -= 1
-
-    def _do_wall_jump(self):
-        if self.on_wall_left:
-            self.vel.x = self.wall_jump_x
-        elif self.on_wall_right:
-            self.vel.x = -self.wall_jump_x
-        self.vel.y = -self.wall_jump_y
-        self.wall_stick_timer = 0.0
-        if self.jumps_left == self.max_jumps:
-            self.jumps_left -= 1
-
-    # ------------------------------------------------------------
-    # Pathfinding (tile BFS)
-    # ------------------------------------------------------------
-    def _pathfind_update(self, dt: float, player_rect: pygame.Rect, grid: List[str]):
-        self.repath_timer -= dt
-        rows = len(grid)
-        cols = len(grid[0]) if rows else 0
-        if rows == 0 or cols == 0:
-            self.path = []
-            self.path_index = 0
-            return
-
-        player_cell = self._world_to_cell(player_rect.centerx, player_rect.centery)
-        enemy_cell = self._world_to_cell(self.pos.x, self.pos.y)
-
-        need_repath = False
-        if self._last_player_cell != player_cell:
-            need_repath = True
-        if self.repath_timer <= 0.0:
-            need_repath = True
-        if self.path_index >= len(self.path):
-            need_repath = True
-
-        if need_repath:
-            self.repath_timer = self.repath_interval
-            self._last_player_cell = player_cell
-
-            path = self._bfs_path(grid, enemy_cell, player_cell)
-            if path is None:
-                self.path = []
-                self.path_index = 0
-            else:
-                self.path = path
-                self.path_index = 0
-
-    def _desired_move_dir(self, player_rect: pygame.Rect) -> float:
-        if self.path and self.path_index < len(self.path):
-            tx, ty = self.path[self.path_index]
-            target = self._cell_center(tx, ty)
-            dx = target.x - self.pos.x
-
-            if abs(dx) < (TILE_SIZE * 0.25) and abs(target.y - self.pos.y) < (TILE_SIZE * 0.7):
-                self.path_index = min(self.path_index + 1, len(self.path))
-
-            if abs(dx) > 6:
-                return 1.0 if dx > 0 else -1.0
-            return 0.0
-
-        dx = player_rect.centerx - self.pos.x
-        if abs(dx) > 6:
-            return 1.0 if dx > 0 else -1.0
-        return 0.0
-
-    def _bfs_path(self, grid: List[str], start: Tuple[int, int], goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-        rows = len(grid)
-        cols = len(grid[0]) if rows else 0
-
-        sx, sy = start
-        gx, gy = goal
-
-        if not (0 <= sx < cols and 0 <= sy < rows):
-            return None
-        if not (0 <= gx < cols and 0 <= gy < rows):
-            return None
-
-        if not self._is_walkable(grid, gx, gy):
-            found = self._nearest_walkable(grid, gx, gy, radius=3)
-            if found is None:
-                return None
-            gx, gy = found
-
-        q = deque()  # type: Deque[Tuple[int, int]]
-        q.append((sx, sy))
-
-        came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {}
-        came_from[(sx, sy)] = None
-
-        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
-
-        while q:
-            x, y = q.popleft()
-            if (x, y) == (gx, gy):
+        # spike damage (same logic as player) — no i-frames for now
+        for sp in spikes:
+            if self.rect.colliderect(sp):
+                self.take_damage(30)
                 break
 
-            for dx, dy in dirs:
-                nx, ny = x + dx, y + dy
-                if not (0 <= nx < cols and 0 <= ny < rows):
-                    continue
-                if (nx, ny) in came_from:
-                    continue
-                if not self._is_walkable(grid, nx, ny):
-                    continue
-                came_from[(nx, ny)] = (x, y)
-                q.append((nx, ny))
+        # reset stocks
+        if self.on_ground:
+            self.jumps_left = 1
+            self.air_dashes_left = 1
 
-        if (gx, gy) not in came_from:
-            return None
+    def _can_jump(self) -> bool:
+        return self.on_ground or (self.coyote > 0.0) or (self.jumps_left > 0)
 
-        path_rev: List[Tuple[int, int]] = []
-        cur: Optional[Tuple[int, int]] = (gx, gy)
-        while cur is not None:
-            path_rev.append(cur)
-            cur = came_from.get(cur, None)
+    def _do_jump(self):
+        if not (self.on_ground or self.coyote > 0.0):
+            self.jumps_left -= 1
+        self.vel.y = -self.jump_speed
+        self.on_ground = False
+        self.coyote = 0.0
 
-        path_rev.reverse()
-        if path_rev and path_rev[0] == (sx, sy):
-            path_rev = path_rev[1:]
-        return path_rev
+    def _should_jump(self, solids, spikes, move_x: int) -> bool:
+        r = self.rect
 
-    def _nearest_walkable(self, grid: List[str], cx: int, cy: int, radius: int = 3) -> Optional[Tuple[int, int]]:
-        rows = len(grid)
-        cols = len(grid[0]) if rows else 0
-        best = None
-        best_d2 = 10**9
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                x, y = cx + dx, cy + dy
-                if 0 <= x < cols and 0 <= y < rows and self._is_walkable(grid, x, y):
-                    d2 = dx * dx + dy * dy
-                    if d2 < best_d2:
-                        best_d2 = d2
-                        best = (x, y)
-        return best
-
-    def _is_walkable(self, grid: List[str], x: int, y: int) -> bool:
-        return grid[y][x] not in SOLIDS
-
-    def _world_to_cell(self, wx: float, wy: float) -> Tuple[int, int]:
-        return int(wx // TILE_SIZE), int(wy // TILE_SIZE)
-
-    def _cell_center(self, cx: int, cy: int) -> pygame.Vector2:
-        return pygame.Vector2(cx * TILE_SIZE + TILE_SIZE * 0.5, cy * TILE_SIZE + TILE_SIZE * 0.5)
-
-    # ------------------------------------------------------------
-    # Probes: spike / gap / enemy
-    # ------------------------------------------------------------
-    def _spike_ahead(self, move_dir: float, grid: List[str]) -> bool:
-        """
-        Checks 1–2 tiles ahead for a spike '^' sitting on top of solid.
-        We check at "feet landing" height, not current head height.
-        """
-        if move_dir == 0.0:
-            return False
-
-        rows = len(grid)
-        cols = len(grid[0]) if rows else 0
-        if rows == 0 or cols == 0:
-            return False
-
-        # Look ahead by ~1 tile in the movement direction
-        look_dist = max(TILE_SIZE * 0.9, self.radius * 2.2)
-        foot_x = self.pos.x + (move_dir * look_dist)
-        foot_y = self.pos.y + self.radius + 2
-
-        cx = int(foot_x // TILE_SIZE)
-        cy = int((foot_y - 1) // TILE_SIZE)
-
-        # Also check the next tile beyond that (helps at higher speeds)
-        cx2 = int((foot_x + move_dir * (TILE_SIZE * 0.75)) // TILE_SIZE)
-
-        for tx in (cx, cx2):
-            if not (0 <= tx < cols and 0 <= cy < rows):
-                continue
-            if grid[cy][tx] == "^":
+        # Spike ahead?
+        ahead = r.move(move_x * (self.radius + 6), 0)
+        ahead_in_front = ahead.inflate(10, 10)
+        for sp in spikes:
+            if ahead_in_front.colliderect(sp):
                 return True
 
-        return False
+        # Wall/step ahead?
+        foot = pygame.Rect(r.centerx + move_x * (self.radius + 6), r.bottom - 10, 6, 10)
+        head = pygame.Rect(r.centerx + move_x * (self.radius + 6), r.top + 6, 6, r.height - 20)
 
-    def _gap_ahead(self, move_dir: float, grid: List[str]) -> bool:
-        if move_dir == 0.0:
-            return False
+        hit_foot = False
+        hit_head = False
+        for s in solids:
+            if foot.colliderect(s):
+                hit_foot = True
+            if head.colliderect(s):
+                hit_head = True
+            if hit_foot or hit_head:
+                break
 
-        rows = len(grid)
-        cols = len(grid[0]) if rows else 0
-        if rows == 0 or cols == 0:
-            return False
-
-        foot_x = self.pos.x + (move_dir * self.radius * 1.2)
-        foot_y = self.pos.y + self.radius + 2
-
-        cx = int(foot_x // TILE_SIZE)
-        cy = int(foot_y // TILE_SIZE)
-
-        if not (0 <= cx < cols and 0 <= cy < rows):
+        # If blocked at feet or head, try jump
+        if hit_foot or hit_head:
             return True
 
-        # if the tile at foot_y is solid, we're already intersecting ground; treat as not-gap
-        # the "gap" we care about is whether there will be ground below the landing tile
-        ground_y = cy
-        ch = grid[ground_y][cx]
-        return ch not in SOLIDS
-
-    def _blocked_by_enemy(self, move_dir: float, neighbors) -> bool:
-        if move_dir == 0.0:
-            return False
-
-        probe = self.rect.copy()
-        probe.x += int(move_dir * (self.radius + 8))
-        probe.y += int(self.radius * 0.25)
-        probe.height = int(self.radius * 1.2)
-
-        for other in neighbors:
-            if other is self or other.dead:
-                continue
-            if probe.colliderect(other.rect):
-                return True
         return False
 
-    # ------------------------------------------------------------
-    # Tile collision
-    # ------------------------------------------------------------
-    def _move_x(self, dt: float, solids):
+    def _should_dash(self, enemies_near, solids, move_x: int) -> bool:
+        # if pushing into a wall, dash to "climb"
+        if self.wall_dir != 0 and ((move_x < 0 and self.wall_dir < 0) or (move_x > 0 and self.wall_dir > 0)):
+            return True
+
+        # if crowded in front, dash sometimes
+        r = self.rect
+        front = r.move(move_x * (self.radius + 10), 0)
+        cnt = 0
+        for e in enemies_near:
+            if e is self or getattr(e, "dead", False):
+                continue
+            if front.colliderect(e.rect):
+                cnt += 1
+                if cnt >= 2:
+                    return True
+
+        return False
+
+    def _detect_wall(self, solids) -> int:
+        r = self.rect
+        left_probe = pygame.Rect(r.left - 1, r.top + 2, 1, r.height - 4)
+        right_probe = pygame.Rect(r.right, r.top + 2, 1, r.height - 4)
+
+        hit_left = False
+        hit_right = False
+        for s in solids:
+            if left_probe.colliderect(s):
+                hit_left = True
+            if right_probe.colliderect(s):
+                hit_right = True
+            if hit_left and hit_right:
+                break
+
+        if hit_left and not hit_right:
+            return -1
+        if hit_right and not hit_left:
+            return +1
+        return 0
+
+    def _move_and_collide(self, dt: float, solids):
+        # X
         self.pos.x += self.vel.x * dt
         r = self.rect
+        r.x = int(self.pos.x - self.radius)
+
         for s in solids:
             if r.colliderect(s):
                 if self.vel.x > 0:
-                    self.pos.x = s.left - self.radius
+                    r.right = s.left
                 elif self.vel.x < 0:
-                    self.pos.x = s.right + self.radius
+                    r.left = s.right
+                self.pos.x = r.centerx
                 self.vel.x = 0.0
-                r = self.rect
 
-    def _move_y(self, dt: float, solids):
+        # Y
         self.pos.y += self.vel.y * dt
+        r.y = int(self.pos.y - self.radius)
+
         self.on_ground = False
-        r = self.rect
         for s in solids:
             if r.colliderect(s):
                 if self.vel.y > 0:
-                    self.pos.y = s.top - self.radius
-                    self.vel.y = 0.0
+                    r.bottom = s.top
                     self.on_ground = True
                 elif self.vel.y < 0:
-                    self.pos.y = s.bottom + self.radius
-                    self.vel.y = 0.0
-                r = self.rect
+                    r.top = s.bottom
+                self.pos.y = r.centery
+                self.vel.y = 0.0
 
-    def _update_wall_flags(self, solids):
-        self.on_wall_left = False
-        self.on_wall_right = False
-        if self.on_ground:
-            return
-
-        left_probe = self.rect.move(-1, 0)
-        right_probe = self.rect.move(1, 0)
-
-        for s in solids:
-            if left_probe.colliderect(s):
-                self.on_wall_left = True
-            if right_probe.colliderect(s):
-                self.on_wall_right = True
-            if self.on_wall_left and self.on_wall_right:
-                break
-
-    # ------------------------------------------------------------
-    # Draw
-    # ------------------------------------------------------------
     def draw(self, surf: pygame.Surface, camera):
-        if self.dead:
-            return
+        rr = camera.apply(self.rect)
+        cx, cy = rr.center
 
-        rr_screen = camera.apply(self.rect)
-        cx, cy = rr_screen.center
+        pygame.draw.circle(surf, self.color, (cx, cy), self.radius)
+        pygame.draw.circle(surf, (20, 20, 26), (cx, cy), self.radius, 2)
 
-        pygame.draw.circle(surf, (240, 120, 120), (cx, cy), self.radius)
-
-        bar_w = 40
-        bar_h = 6
-        pct = max(0.0, min(1.0, self.health / self.max_health))
-        fill_w = int(bar_w * pct)
-
-        bx = cx - bar_w // 2
-        by = cy - self.radius - 14
-
-        pygame.draw.rect(surf, (40, 40, 55), (bx, by, bar_w, bar_h))
-        pygame.draw.rect(surf, (220, 80, 80), (bx, by, fill_w, bar_h))
-        pygame.draw.rect(surf, (230, 230, 240), (bx, by, bar_w, bar_h), 1)
+        # health bar
+        if self.max_health > 0:
+            pct = max(0.0, min(1.0, self.health / self.max_health))
+            bw = self.radius * 2
+            bh = 5
+            x = rr.left
+            y = rr.top - 10
+            pygame.draw.rect(surf, (40, 40, 55), (x, y, bw, bh))
+            pygame.draw.rect(surf, (240, 120, 120), (x, y, int(bw * pct), bh))
+            pygame.draw.rect(surf, (230, 230, 240), (x, y, bw, bh), 1)
